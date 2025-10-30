@@ -1,0 +1,9 @@
+# sample requirements.txt  -- we can add more as needed
+
+#to install all the required packages, run: pip install -r requirements.txt
+#if you install a package while developing, make sure you update the requirements.txt using this command: pip freeze > requirements.txt
+
+python>=3.10,<3.13
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.5.0
