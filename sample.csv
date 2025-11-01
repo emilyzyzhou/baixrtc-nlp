@@ -1,0 +1,18 @@
+Response_ID,Timestamp,What is your current year in school?,How frequently do you utilize the university resources available to you?,If you rarely or never use resources, what is the primary reason? (Select all that apply),Which area is currently your biggest career focus?,On a scale of 1 (Not comfortable) to 5 (Very comfortable), how comfortable are you with asking professors for help?,Membership_Status
+R001,2024-12-03 14:21,1st-Year,Rarely,Judgment/Inadequacy,Learning New Skills,2,RTC Member
+R002,2024-12-03 15:05,4th-Year,Often,Not Applicable,Learning New Skills,5,RTC Member
+R003,2024-12-04 09:30,2nd-Year,Never,Intimidation,Work-Life Balance,2,RTC Member
+R004,2024-12-05 11:15,Graduate,Sometimes,Time Constraints,Networking,4,RTC Member
+R005,2024-12-06 13:44,3rd-Year,Rarely,Discomfort,,3,RTC Member
+R006,2024-12-09 16:50,1st-Year,,Judgment/Inadequacy,Learning New Skills,1,RTC Member
+R007,2024-12-10 10:20,4th-Year,Often,Not Applicable,Learning New Skills,5,RTC Member
+R008,2024-12-11 12:55,2nd-Year,Sometimes,Discomfort,Networking,3,RTC Member
+R009,2024-12-13 14:01,Graduate,Often,Not Applicable,Learning New Skills,5,RTC Member
+R010,2024-12-15 17:18,3rd-Year,Never,Judgment/Inadequacy,Learning New Skills,2,RTC Member
+R011,2024-12-16 19:33,1st-Year,Rarely,Intimidation,Salary/Benefits,1,RTC Member
+R012,2024-12-17 08:00,4th-Year,Sometimes,Time Constraints,Learning New Skills,4,RTC Member
+R013,2024-12-19 11:45,2nd-Year,Never,Discomfort,Work-Life Balance,2,RTC Member
+R014,2024-12-20 15:22,Graduate,Often,Not Applicable,Learning New Skills,5,RTC Member
+R015,2024-12-22 18:05,3rd-Year,Sometimes,Time Constraints,Learning New Skills,3,RTC Member
+R016,2024-12-23 20:10,4th-Year,Often,Not Applicable,Salary/Benefits,4,RTC Member
+R017,2024-12-24 12:40,1st-Year,Rarely,Judgment/Inadequacy,Networking,1,RTC Member
