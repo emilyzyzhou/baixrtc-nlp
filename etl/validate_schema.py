@@ -12,7 +12,6 @@ def validate_schema(df: pd.DataFrame) -> bool:
         "survey_id": int,
         "question_id": int,
         "question_text": str,
-        # add remaining expected columns here
         "response_id": int,
         "response_text": str,
         "Timestamp": "datetime64[ns]"
