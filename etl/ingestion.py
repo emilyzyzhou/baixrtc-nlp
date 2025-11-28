@@ -1,5 +1,13 @@
 import pandas as pd
 import os
+import string
+from typing import List
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+STOP_WORDS = None
+LEMMATIZER = None
 
 def load_data(folder = "data"):
     dfs = []
@@ -32,6 +40,71 @@ def load_data(folder = "data"):
 
     return compiled_df
 
+def _ensure_nltk():
+    try:
+        nltk.data.find("corpora/stopwords")
+    except LookupError:
+        nltk.download("stopwords")
+
+    try:
+        nltk.data.find("corpora/wordnet")
+    except LookupError:
+        nltk.download("wordnet")
+
+def preprocess_text(text: str, stop_words: set, lemmatizer) -> str: #preprocess a single text entry
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+
+    #basic preprocessing with lowercase, splitting, stopword removal, punctuation removal, lemmatization (task 7)
+    text = text.lower()
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in stop_words]
+    table = str.maketrans("", "", string.punctuation)
+    tokens = [t.translate(table) for t in tokens]
+    tokens = [t for t in tokens if t]
+    tokens = [lemmatizer.lemmatize(t) for t in tokens]
+
+    return " ".join(tokens)
+
+
+def preprocess_dataframe(df: pd.DataFrame, text_cols: List[str] = None, sample_n: int = 30) -> pd.DataFrame:
+    global STOP_WORDS, LEMMATIZER #reference global vars
+    
+    if STOP_WORDS is None or LEMMATIZER is None:
+        _ensure_nltk()
+        STOP_WORDS = set(stopwords.words("english"))
+        LEMMATIZER = WordNetLemmatizer()
+
+    if text_cols is None:
+        text_cols = [c for c in df.columns if pd.api.types.is_object_dtype(df[c])]
+
+    n = min(len(df), sample_n)
+    working = df.iloc[:n].copy()
+
+    for col in text_cols:
+        working[f"{col}_clean"] = working[col].astype(str).apply(
+            lambda t: preprocess_text(t, STOP_WORDS, LEMMATIZER)
+        )
+
+    for col in text_cols:
+        new_col = f"{col}_clean"
+        if new_col not in df.columns:
+            df[new_col] = ""
+        df.loc[:n-1, new_col] = working[new_col].values
+
+    return df
+
+
+def save_processed(df: pd.DataFrame, out_path: str = "data/processed/cleaned.csv"): #following naming conventions mentioned in task 7
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    df.to_csv(out_path, index=False)
+
 
 if __name__ == "__main__":
-    load_data()
+    df = load_data()
+    print("Preprocessing sample rows (up to 30) and saving to data/processed/cleaned.csv")
+    df2 = preprocess_dataframe(df, sample_n=30)
+    save_processed(df2, os.path.join("data", "processed", "cleaned.csv"))
+    print("Saved cleaned sample to data/processed/cleaned.csv")
