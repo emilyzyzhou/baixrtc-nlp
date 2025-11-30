@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import string
+import regex as re
 from typing import List
 import nltk
 from nltk.corpus import stopwords
@@ -57,18 +58,16 @@ def preprocess_text(text: str, stop_words: set, lemmatizer) -> str: #preprocess 
 
     #basic preprocessing with lowercase, splitting, stopword removal, punctuation removal, lemmatization (task 7)
     text = text.lower()
+    text = re.sub(r'\p{P}+', ' ', text, flags=re.UNICODE)
     tokens = text.split()
     tokens = [t for t in tokens if t not in stop_words]
-    table = str.maketrans("", "", string.punctuation)
-    tokens = [t.translate(table) for t in tokens]
-    tokens = [t for t in tokens if t]
     tokens = [lemmatizer.lemmatize(t) for t in tokens]
 
     return " ".join(tokens)
 
 
-def preprocess_dataframe(df: pd.DataFrame, text_cols: List[str] = None, sample_n: int = 30) -> pd.DataFrame:
-    global STOP_WORDS, LEMMATIZER #reference global vars
+def preprocess_dataframe(df: pd.DataFrame, text_cols: List[str] = None) -> pd.DataFrame:
+    global STOP_WORDS, LEMMATIZER
     
     if STOP_WORDS is None or LEMMATIZER is None:
         _ensure_nltk()
@@ -76,23 +75,27 @@ def preprocess_dataframe(df: pd.DataFrame, text_cols: List[str] = None, sample_n
         LEMMATIZER = WordNetLemmatizer()
 
     if text_cols is None:
-        text_cols = [c for c in df.columns if pd.api.types.is_object_dtype(df[c])]
+        # auto-detect likely text columns: columns containing any alphabetic character
+        detected: list[str] = []
+        for c in df.columns:
+            # skip obviously non-text columns
+            if c.lower() in {"survey_id", "question_id", "response_id", "timestamp", "sheet_name"}:
+                continue
+            s = df[c].astype(str)
+            if s.str.contains(r"[A-Za-z]", regex=True).any():
+                detected.append(c)
+        text_cols = detected
 
-    n = min(len(df), sample_n)
-    working = df.iloc[:n].copy()
+    cleaned_df = df.copy()
 
     for col in text_cols:
-        working[f"{col}_clean"] = working[col].astype(str).apply(
+        # Replace original column instead of creating new one
+        cleaned_df[col] = cleaned_df[col].astype(str).apply(
             lambda t: preprocess_text(t, STOP_WORDS, LEMMATIZER)
         )
 
-    for col in text_cols:
-        new_col = f"{col}_clean"
-        if new_col not in df.columns:
-            df[new_col] = ""
-        df.loc[:n-1, new_col] = working[new_col].values
+    return cleaned_df
 
-    return df
 
 
 def save_processed(df: pd.DataFrame, out_path: str = "data/processed/cleaned.csv"): #following naming conventions mentioned in task 7
@@ -104,7 +107,7 @@ def save_processed(df: pd.DataFrame, out_path: str = "data/processed/cleaned.csv
 
 if __name__ == "__main__":
     df = load_data()
-    print("Preprocessing sample rows (up to 30) and saving to data/processed/cleaned.csv")
-    df2 = preprocess_dataframe(df, sample_n=30)
+    print("Preprocessing entire dataset and saving to data/processed/cleaned.csv")
+    df2 = preprocess_dataframe(df)
     save_processed(df2, os.path.join("data", "processed", "cleaned.csv"))
-    print("Saved cleaned sample to data/processed/cleaned.csv")
+    print("Saved cleaned dataset to data/processed/cleaned.csv")
