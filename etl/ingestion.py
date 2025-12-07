@@ -8,8 +8,10 @@ def load_data(folder = "data"):
 
     #loops through xlsx files in data folder
     for file in os.listdir(folder):
+        file_path = os.path.join(folder, file)
+
+        #handle xlsx files
         if file.lower().endswith(".xlsx"):
-            file_path = os.path.join(folder, file)
             #get sheets w data
             data = pd.ExcelFile(file_path)
             #print(data.sheet_names)
@@ -20,6 +22,12 @@ def load_data(folder = "data"):
                 df["sheet_name"] = sheet_name
                 dfs.append(df)
             data.close()
+        
+        #handle csv files
+        elif file.lower().endswith(".csv"):
+            df = pd.read_csv(file_path).fillna("")
+            df["sheet_name"] = os.path.splitext(file)[0] #use file name as sheet name
+            dfs.append(df)
 
     #compile all dfs into one
     compiled_df = pd.concat(dfs, ignore_index=True)
