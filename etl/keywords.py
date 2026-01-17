@@ -18,6 +18,10 @@ def _ensure_nltk_for_rake() -> None:
     except LookupError:
         nltk.download("punkt")
 
+    try: 
+        nltk.data.find("tokenizers/punkt_tab")
+    except LookupError:
+        nltk.download("punkt_tab")
 
 def extract_keywords(text: Optional[str], max_phrases: int = 5) -> List[str]:
     
