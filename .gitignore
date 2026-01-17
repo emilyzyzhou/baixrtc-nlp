@@ -9,3 +9,4 @@ venv/
 
 #survey data
 data/
+tests/output/

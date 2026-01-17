@@ -1,17 +1,20 @@
-import pytest, pandas
-from etl/ingestion.py import load_data
+'''Tests corresponding to ingestion.py methods - use python -m pytest to run'''
+import pytest, pandas as pd
+from etl.ingestion import load_data
 
 '''Puts all output dfs into one csv to check content'''
-def test_load_data:
+def test_load_data():
     dfs = load_data()
-
+    first_df = dfs[0]
+    first_df.to_csv("tests/output/first_output.csv", index=False)
     #compile all dfs into one
-    compiled_df = pd.concat(dfs, ignore_index=True)
+    compiled_df = pd.concat(dfs, axis=1) #no ignore index for axis=1
     #reorder so sheet_name is first 
     cols = compiled_df.columns.tolist()
-    cols.remove("sheet_name")
-    compiled_df = compiled_df[["sheet_name"] + cols]
     #output to csv for manual checking
-    compiled_df.to_csv('data/output.csv', index=False) #make sure you don't have csv open
+    compiled_df.to_csv("tests/output/output.csv", index=False)
 
     return compiled_df
+
+if __name__ == "__main__":
+    test_load_data()
