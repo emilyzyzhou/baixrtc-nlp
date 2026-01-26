@@ -1,0 +1,6 @@
+pandas
+openpyxl
+regex
+nltk
+rake-nltk
+vaderSentiment
