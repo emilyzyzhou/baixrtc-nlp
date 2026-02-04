@@ -119,6 +119,9 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
                     
                     # update: transforming each column from wide to long format for easier sentiment analysis
                     for col in df.columns:
+                        normalized_col = re.sub(r"\s+", " ", str(col)).strip().lower()
+                        if normalized_col in {"sheet name", "sheetname", "sheet_name"}: #this question is metadata not a real question (skews the number of neutral responses)
+                            continue
                         # skip empty columns
                         if df[col].isna().all():
                             continue
@@ -148,6 +151,9 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
                 
                 # transform from wide to long
                 for col in df.columns:
+                    normalized_col = re.sub(r"\s+", " ", str(col)).strip().lower()
+                    if normalized_col in {"sheet name", "sheetname", "sheet_name"}:
+                        continue
                     if df[col].isna().all():
                         continue
                     
