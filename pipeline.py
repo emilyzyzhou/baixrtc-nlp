@@ -1,7 +1,8 @@
 import pandas as pd
 import os
+import json
 import regex as re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
@@ -364,34 +365,38 @@ def add_sentiment_analysis(df: pd.DataFrame) -> pd.DataFrame:
 # STEP 4: KEYWORDS - extract key phrases
 # =============================================================================
 
-def extract_keywords(text: Optional[str], max_phrases: int = 5) -> List[str]:
+def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int]:
     """
     extracting keyword phrases from text using RAKE algorithm.
     text: Input text
     max_phrases: Maximum number of phrases to extract
+    returns: Dictionary mapping keywords to their frequency counts
     """
     if text is None or not isinstance(text, str):
-        return []
+        return {}
     
     text = str(text).strip()
     if not text or len(text) < 3:
-        return []
+        return {}
     
     try:
         rake = _get_rake()
         rake.extract_keywords_from_text(text)
         phrases = rake.get_ranked_phrases()
         
-        keywords = []
-        for p in phrases:
-            p = p.strip()
-            if len(p) < 3:
+        keyword_dict = {}
+        for phrase in phrases:
+            phrase = phrase.strip()
+            if len(phrase) < 3:
                 continue  # ignore super short junk
-            keywords.append(p)
-            if len(keywords) >= max_phrases:
+            # count how many times this phrase appears in the text
+            count = text.lower().count(phrase.lower())
+            if count > 0:
+                keyword_dict[phrase] = count
+            if len(keyword_dict) >= max_phrases:
                 break
         
-        return keywords
+        return keyword_dict
     except Exception as e:
         global KEYWORD_EXTRACTION_ERROR_SHOWN, STOP_WORDS, LEMMATIZER
         if not KEYWORD_EXTRACTION_ERROR_SHOWN:
@@ -405,14 +410,14 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> List[str]:
         cleaned = preprocess_text(text, STOP_WORDS, LEMMATIZER)
         tokens = [t for t in cleaned.split() if len(t) > 2]
         if not tokens:
-            return []
+            return {}
         counts = Counter(tokens)
-        return [w for w, _ in counts.most_common(max_phrases)]
+        return dict(counts.most_common(max_phrases))
 
 
 def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
     """
-    add keywords column to df
+    add keywords column to df (stored as JSON with frequency counts)
     """
     print("\n[STEP 4/5] KEYWORDS - Extracting key phrases...")
     
@@ -420,11 +425,11 @@ def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
     
     # using uncleaned text for better keyword extraction
     df_with_keywords["keywords"] = df_with_keywords["response_text_original"].apply(
-        lambda t: ", ".join(extract_keywords(t))
+        lambda t: json.dumps(extract_keywords(t))
     )
     
     # count non-empty keyword extractions
-    non_empty = (df_with_keywords["keywords"].str.len() > 0).sum()
+    non_empty = (df_with_keywords["keywords"].str.len() > 2).sum()  # {} is 2 chars
     print(f"  extracted keywords from {non_empty:,} responses ({non_empty/len(df_with_keywords)*100:.1f}%)")
     
     return df_with_keywords
@@ -466,17 +471,15 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
             summary["negative_responses"] = (group["sentiment_label"] == "negative").sum()
             summary["neutral_responses"] = (group["sentiment_label"] == "neutral").sum()
         
-        # top keywords (aggregated across all responses)
-        if "keywords" in group.columns:
-            all_keywords = []
-            for kw_str in group["keywords"].dropna():
-                if kw_str:
-                    all_keywords.extend([k.strip() for k in str(kw_str).split(",")])
-            
-            keyword_counts = Counter(all_keywords)
-            top_keywords = [kw for kw, _ in keyword_counts.most_common(10)]
-            summary["top_keywords"] = ", ".join(top_keywords[:5])
-            summary["all_top_keywords"] = ", ".join(top_keywords)
+        # top keywords (extracted and aggregated with frequencies)
+        all_keywords = Counter()
+        for text in group["response_text_original"].dropna():
+            kw_dict = extract_keywords(text)
+            all_keywords.update(kw_dict)
+        
+        # store top keywords as JSON map with frequencies
+        top_10 = dict(all_keywords.most_common(10))
+        summary["topic_modeling"] = json.dumps(top_10) if top_10 else "{}"
         
         # survey sources
         summary["survey_sources"] = ", ".join(group["sheet_name"].unique())
@@ -517,6 +520,7 @@ def run_pipeline(
     df = preprocess_dataframe(df)
     df = add_sentiment_analysis(df)
     df = add_keyword_extraction(df)
+    df = df.drop(columns=["keywords"])
     summary_df = generate_summary_by_question(df)
     
     # create output directory
@@ -564,16 +568,4 @@ def run_pipeline(
 
 if __name__ == "__main__":
     responses_df, summary_df = run_pipeline()
-    
-    # displaying sample output for now
-    print("\n" + "=" * 80)
-    print("SAMPLE OUTPUT - responses_with_features.csv (first 3 rows):")
-    print("=" * 80)
-    sample_cols = ['question_id', 'response_text_original', 'sentiment_label', 'keywords']
-    print(responses_df[sample_cols].head(3).to_string())
-    
-    print("\n" + "=" * 80)
-    print("SAMPLE OUTPUT - summary_by_question.csv (top 5 questions):")
-    print("=" * 80)
-    summary_cols = ['question_text', 'total_responses', 'avg_sentiment_score', 'top_keywords']
-    print(summary_df[summary_cols].head(5).to_string())
+    print("Done!")
