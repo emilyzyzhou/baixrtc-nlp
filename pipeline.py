@@ -459,14 +459,14 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
             "question_id": qid,
             "question_text": qtext,
             "total_responses": len(group),
-            "avg_response_length": group["response_length"].mean(),
-            "avg_word_count": group["word_count"].mean(),
+            "avg_response_length": round(group["response_length"].mean(), 2),
+            "avg_word_count": round(group["word_count"].mean(), 2),
         }
         
         # sentiment statistics
         if "sentiment_score" in group.columns:
-            summary["avg_sentiment_score"] = group["sentiment_score"].mean()
-            summary["sentiment_std"] = group["sentiment_score"].std()
+            summary["avg_sentiment_score"] = round(group["sentiment_score"].mean(), 2)
+            summary["sentiment_std"] = round(group["sentiment_score"].std(), 2)
             summary["positive_responses"] = (group["sentiment_label"] == "positive").sum()
             summary["negative_responses"] = (group["sentiment_label"] == "negative").sum()
             summary["neutral_responses"] = (group["sentiment_label"] == "neutral").sum()
