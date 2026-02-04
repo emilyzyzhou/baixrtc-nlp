@@ -48,16 +48,23 @@ SENTIMENT_ANALYZER = None
 # STEP 0: setup helpers
 # =============================================================================
 
-def _ensure_nltk():
-    try:
-        nltk.data.find("corpora/stopwords")
-    except LookupError:
-        nltk.download("stopwords")
+def _ensure_nltk(): #fixed this to check for all required resources at once
+    resources = [
+        ("corpora/stopwords", "stopwords"),
+        ("corpora/wordnet", "wordnet"),
+        ("tokenizers/punkt", "punkt"),
+    ]
 
-    try:
-        nltk.data.find("corpora/wordnet")
-    except LookupError:
-        nltk.download("wordnet")
+    for resource_path, resource_name in resources:
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            downloaded = nltk.download(resource_name, quiet=True)
+            if not downloaded:
+                raise RuntimeError(
+                    f"NLTK resource download failed: {resource_name}. "
+                    "Check your network or NLTK data path."
+                )
 
 
 def _get_sentiment_analyzer():
