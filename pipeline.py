@@ -43,6 +43,8 @@ NON_TEXT_LIKE_COLUMNS = {
 STOP_WORDS = None
 LEMMATIZER = None
 SENTIMENT_ANALYZER = None
+KEYWORD_EXTRACTION_ERROR_SHOWN = False
+RAKE_INSTANCE = None
 
 # =============================================================================
 # STEP 0: setup helpers
@@ -73,6 +75,15 @@ def _get_sentiment_analyzer():
     if SENTIMENT_ANALYZER is None and VADER_AVAILABLE:
         SENTIMENT_ANALYZER = SentimentIntensityAnalyzer()
     return SENTIMENT_ANALYZER
+
+
+def _get_rake():
+    """Get or initialize RAKE keyword extractor."""
+    global RAKE_INSTANCE
+    if RAKE_INSTANCE is None:
+        _ensure_nltk()
+        RAKE_INSTANCE = Rake()  # default English stopwords + punkt
+    return RAKE_INSTANCE
 
 
 # =============================================================================
@@ -366,25 +377,37 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> List[str]:
     if not text or len(text) < 3:
         return []
     
-    _ensure_nltk()
-    
     try:
-        rake = Rake()  #default English stopwords + punkt
+        rake = _get_rake()
         rake.extract_keywords_from_text(text)
         phrases = rake.get_ranked_phrases()
         
         keywords = []
         for p in phrases:
             p = p.strip()
-            if len(p) < 3:  
-                continue  #ignore super short junk
+            if len(p) < 3:
+                continue  # ignore super short junk
             keywords.append(p)
             if len(keywords) >= max_phrases:
                 break
         
         return keywords
-    except:
-        return []
+    except Exception as e:
+        global KEYWORD_EXTRACTION_ERROR_SHOWN, STOP_WORDS, LEMMATIZER
+        if not KEYWORD_EXTRACTION_ERROR_SHOWN:
+            print(f"[WARN] Keyword extraction failed; using fallback. Error: {e}")
+            KEYWORD_EXTRACTION_ERROR_SHOWN = True
+
+        if STOP_WORDS is None or LEMMATIZER is None:
+            STOP_WORDS = set(stopwords.words("english"))
+            LEMMATIZER = WordNetLemmatizer()
+
+        cleaned = preprocess_text(text, STOP_WORDS, LEMMATIZER)
+        tokens = [t for t in cleaned.split() if len(t) > 2]
+        if not tokens:
+            return []
+        counts = Counter(tokens)
+        return [w for w, _ in counts.most_common(max_phrases)]
 
 
 def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
@@ -503,8 +526,21 @@ def run_pipeline(
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
     
-    df.to_csv(responses_path, index=False)
-    summary_df.to_csv(summary_path, index=False)
+    try:
+        df.to_csv(responses_path, index=False)
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        responses_path = os.path.join(output_folder, f"responses_with_features_{ts}.csv")
+        print(f"[WARN] Permission denied for responses file. Writing to: {responses_path}")
+        df.to_csv(responses_path, index=False)
+
+    try:
+        summary_df.to_csv(summary_path, index=False)
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_path = os.path.join(output_folder, f"summary_by_question_{ts}.csv")
+        print(f"[WARN] Permission denied for summary file. Writing to: {summary_path}")
+        summary_df.to_csv(summary_path, index=False)
     
     # final summary
     print("\n" + "=" * 80)
