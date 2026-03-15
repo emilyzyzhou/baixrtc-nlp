@@ -50,8 +50,8 @@ METADATA:
 
 FILE 2: summary_by_question.csv
 --------------------------------
-Question-level aggregated statistics - each row represents one question
-Total columns: 12
+Question-level aggregated statistics - each row represents one question-keyword combination
+Total columns: 13
 
 IDENTIFIERS:
   question_id          Unique question identifier (matches responses file)
@@ -69,13 +69,23 @@ SENTIMENT STATISTICS:
   negative_responses      Count of negative responses
   neutral_responses       Count of neutral responses
 
-TOPIC MODELING:
-  topic_modeling      JSON object mapping top 10 keywords to frequency counts
-                     Example: {"career growth": 15, "mentorship": 12, ...}
-                     Use for word clouds, topic analysis, trending themes
+KEYWORD ANALYSIS:
+  keyword             Individual keyword extracted from responses to this question
+  frequency           How many times this keyword appeared across all responses
 
 METADATA:
   survey_sources      Comma-separated list of sheets containing this question
+
+FILE 3: keywords.csv
+--------------------
+Simple keyword frequency list - each keyword appears as many times as its frequency
+Total columns: 1
+
+KEYWORD:
+  keyword             Individual keyword repeated by frequency count
+                     Top 10 keywords across ALL meaningful responses (not per question)
+                     Filters out generic words (yes, no, maybe, good, bad, etc.) and
+                     excludes responses from yes/no questions (avg response length < 10 chars)
 
 
 ================================================================================
@@ -98,7 +108,14 @@ summary_by_question.csv:
   • Questions ranked by avg_sentiment_score
   • Bar charts showing positive/negative/neutral counts
   • Top questions by total_responses
-  • Parse topic_modeling JSON for word clouds (Tableau prep needed)
+  • Word clouds using keyword and frequency columns (no JSON parsing needed!)
+  • Keyword frequency analysis across questions
+  • Filter keywords by minimum frequency threshold
+
+keywords.csv:
+  • Simple word clouds (each word appears by frequency)
+  • Basic keyword frequency visualization
+  • Import into simple word cloud tools
 
 FILTERING:
 - Filter by survey_sources to compare surveys

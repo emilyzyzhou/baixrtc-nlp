@@ -47,6 +47,18 @@ SENTIMENT_ANALYZER = None
 KEYWORD_EXTRACTION_ERROR_SHOWN = False
 RAKE_INSTANCE = None
 
+# Keywords to exclude from analysis (generic responses)
+EXCLUDED_KEYWORDS = {
+    "yes", "no", "maybe", "perhaps", "sure", "okay", "ok", "alright", "fine", "good",
+    "bad", "great", "excellent", "poor", "terrible", "awesome", "amazing", "horrible",
+    "wonderful", "nice", "well", "very", "really", "so", "too", "quite", "pretty",
+    "kind", "sort", "bit", "lot", "lots", "much", "many", "some", "any", "all",
+    "none", "every", "each", "both", "either", "neither", "one", "two", "three",
+    "four", "five", "first", "second", "third", "last", "next", "new", "old",
+    "big", "small", "large", "little", "long", "short", "high", "low", "right",
+    "wrong", "true", "false", "able", "unable", "possible", "impossible"
+}
+
 # =============================================================================
 # STEP 0: setup helpers
 # =============================================================================
@@ -389,6 +401,12 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
             phrase = phrase.strip()
             if len(phrase) < 3:
                 continue  # ignore super short junk
+            
+            # Skip excluded generic keywords
+            phrase_lower = phrase.lower()
+            if phrase_lower in EXCLUDED_KEYWORDS:
+                continue
+            
             # count how many times this phrase appears in the text
             count = text.lower().count(phrase.lower())
             if count > 0:
@@ -408,7 +426,7 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
             LEMMATIZER = WordNetLemmatizer()
 
         cleaned = preprocess_text(text, STOP_WORDS, LEMMATIZER)
-        tokens = [t for t in cleaned.split() if len(t) > 2]
+        tokens = [t for t in cleaned.split() if len(t) > 2 and t.lower() not in EXCLUDED_KEYWORDS]
         if not tokens:
             return {}
         counts = Counter(tokens)
@@ -441,59 +459,130 @@ def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
 
 def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
     """
-    adding summary statistics grouped by question:
-    - response count
-    - average metrics
-    - sentiment distribution
-    - top keywords
+    Generate summary statistics grouped by question with keywords expanded to separate rows.
+
+    To allow Tableau to better aggregate keywords, creates one row per keyword per question.
+
+    Output format:
+    - One row per question-keyword combination
+    - Tableau can easily count, filter, and visualize keywords across questions
     """
     print("\n[STEP 5/5] EXPORT - generating summaries...")
-    
+
     summary_data = []
-    
-    # grouping by question
+
+    # Group by question
     grouped = df.groupby(["question_id", "question_text_original"])
-    
+
     for (qid, qtext), group in grouped:
-        summary = {
+        # Calculate base question statistics (same for all keywords in this question)
+        base_stats = {
             "question_id": qid,
             "question_text": qtext,
             "total_responses": len(group),
             "avg_response_length": round(group["response_length"].mean(), 2),
             "avg_word_count": round(group["word_count"].mean(), 2),
         }
-        
-        # sentiment statistics
+
+        # Add sentiment statistics
         if "sentiment_score" in group.columns:
-            summary["avg_sentiment_score"] = round(group["sentiment_score"].mean(), 2)
-            summary["sentiment_std"] = round(group["sentiment_score"].std(), 2)
-            summary["positive_responses"] = (group["sentiment_label"] == "positive").sum()
-            summary["negative_responses"] = (group["sentiment_label"] == "negative").sum()
-            summary["neutral_responses"] = (group["sentiment_label"] == "neutral").sum()
-        
-        # top keywords (extracted and aggregated with frequencies)
+            base_stats.update({
+                "avg_sentiment_score": round(group["sentiment_score"].mean(), 2),
+                "sentiment_std": round(group["sentiment_score"].std(), 2),
+                "positive_responses": (group["sentiment_label"] == "positive").sum(),
+                "negative_responses": (group["sentiment_label"] == "negative").sum(),
+                "neutral_responses": (group["sentiment_label"] == "neutral").sum(),
+            })
+
+        # Survey sources (same for all keywords in this question)
+        base_stats["survey_sources"] = ", ".join(group["sheet_name"].unique())
+
+        # Extract and aggregate keywords across all responses for this question
         all_keywords = Counter()
         for text in group["response_text_original"].dropna():
             kw_dict = extract_keywords(text)
             all_keywords.update(kw_dict)
-        
-        # store top keywords as JSON map with frequencies
-        top_10 = dict(all_keywords.most_common(10))
-        summary["topic_modeling"] = json.dumps(top_10) if top_10 else "{}"
-        
-        # survey sources
-        summary["survey_sources"] = ", ".join(group["sheet_name"].unique())
-        
-        summary_data.append(summary)
-    
+
+        # Get top 10 keywords with frequencies
+        top_keywords = all_keywords.most_common(10)
+
+        # Create one row per keyword (long format for Tableau)
+        if top_keywords:
+            for keyword, frequency in top_keywords:
+                keyword_row = base_stats.copy()
+                keyword_row["keyword"] = keyword
+                keyword_row["frequency"] = frequency
+                summary_data.append(keyword_row)
+        else:
+            # If no keywords found, still create one row with empty keyword
+            keyword_row = base_stats.copy()
+            keyword_row["keyword"] = ""
+            keyword_row["frequency"] = 0
+            summary_data.append(keyword_row)
+
     summary_df = pd.DataFrame(summary_data)
-    
-    # sort by total responses (most answered questions first)
-    summary_df = summary_df.sort_values("total_responses", ascending=False)
-    
-    print(f"  Generated summary for {len(summary_df)} unique questions")
-    
+
+    # Sort by question_id, then by frequency (most frequent keywords first)
+    summary_df = summary_df.sort_values(["question_id", "frequency"], ascending=[True, False])
+
+    print(f"  Generated {len(summary_df):,} keyword rows for {len(summary_df['question_id'].unique())} questions")
+    print(f"  Average {len(summary_df)/len(summary_df['question_id'].unique()):.1f} keywords per question")
+
     return summary_df
+
+
+def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -> None:
+    """
+    Generate a simple keywords CSV where each keyword appears as many times as its frequency.
+    This creates a single-column CSV perfect for simple word cloud tools.
+
+    Filters out generic keywords and responses from yes/no questions for more meaningful topics.
+    """
+    print("\n[STEP 5.5] EXPORT - generating keywords CSV...")
+    
+    # Filter out responses that are likely from yes/no questions
+    # Exclude questions with very short average responses (likely yes/no)
+    question_stats = df.groupby('question_id').agg({
+        'response_length': 'mean',
+        'response_text_original': 'count'
+    }).reset_index()
+    
+    # Keep only questions with average response length > 10 characters
+    meaningful_questions = question_stats[question_stats['response_length'] > 10]['question_id']
+    df_filtered = df[df['question_id'].isin(meaningful_questions)]
+    
+    print(f"  Filtered to {len(df_filtered):,} responses from {len(meaningful_questions)} meaningful questions")
+    
+    # Aggregate keywords across filtered responses
+    all_keywords = Counter()
+    
+    for text in df_filtered["response_text_original"].dropna():
+        kw_dict = extract_keywords(text)
+        all_keywords.update(kw_dict)
+    
+    # Get top 10 keywords
+    top_keywords = all_keywords.most_common(10)
+    
+    # Create DataFrame where each keyword appears frequency times
+    keyword_rows = []
+    for keyword, frequency in top_keywords:
+        # Add 'frequency' number of rows for this keyword
+        for _ in range(frequency):
+            keyword_rows.append({"keyword": keyword})
+
+    keywords_df = pd.DataFrame(keyword_rows)
+
+    # Save to CSV
+    keywords_path = os.path.join(output_folder, "keywords.csv")
+    try:
+        keywords_df.to_csv(keywords_path, index=False)
+        print(f"  Saved {len(keywords_df):,} keyword instances to {keywords_path}")
+        print(f"  Top keywords: {', '.join([f'{kw}({freq})' for kw, freq in top_keywords])}")
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        keywords_path = os.path.join(output_folder, f"keywords_{ts}.csv")
+        print(f"[WARN] Permission denied for keywords file. Writing to: {keywords_path}")
+        keywords_df.to_csv(keywords_path, index=False)
 
 
 # =============================================================================
@@ -522,6 +611,7 @@ def run_pipeline(
     df = add_keyword_extraction(df)
     df = df.drop(columns=["keywords"])
     summary_df = generate_summary_by_question(df)
+    generate_keywords_csv(df, output_folder)  # Create keywords.csv in output folder
     
     # create output directory
     os.makedirs(output_folder, exist_ok=True)
@@ -555,6 +645,8 @@ def run_pipeline(
     print(f"     → {len(df):,} responses with {len(df.columns)} features")
     print(f"  2. {summary_path}")
     print(f"     → {len(summary_df)} questions with aggregated statistics")
+    print(f"  3. {os.path.join(output_folder, 'keywords.csv')}")
+    print(f"     → Simple keyword list for word clouds")
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nReady for Tableau import!")
     print("=" * 80)
