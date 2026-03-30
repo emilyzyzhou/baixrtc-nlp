@@ -8,10 +8,8 @@ PROCESSING FLOW:
 4. KEYWORDS    → Extract key phrases using RAKE algorithm
 5. EXPORT      → Generate two CSV files ready for Tableau
 
-================================================================================
-OUTPUT FILES & FIELD DEFINITIONS
-================================================================================
-
+**OUTPUT FILES & FIELD DEFINITIONS
+**
 FILE 1: responses_with_features.csv
 ------------------------------------
 Row-level data - each row represents one response to one question
@@ -88,10 +86,8 @@ KEYWORD:
                      excludes responses from yes/no questions (avg response length < 10 chars)
 
 
-================================================================================
-USAGE NOTES FOR TABLEAU
-================================================================================
-
+**USAGE NOTES FOR TABLEAU
+**
 LOADING DATA:
 - Import both CSV files as separate data sources
 - Use question_id to join them if needed (one-to-many relationship)
