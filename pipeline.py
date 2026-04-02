@@ -59,6 +59,10 @@ EXCLUDED_KEYWORDS = {
     "wrong", "true", "false", "able", "unable", "possible", "impossible"
 }
 
+SEED_KEYWORDS = {
+    
+}
+
 # =============================================================================
 # STEP 0: setup helpers
 # =============================================================================
@@ -230,8 +234,75 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     return long_df
 
 
+def load_rtc_keywords_from_excel(
+    file_path: str,
+    sheet_name: str = "keywords",
+    first_col_index: int = 0
+) -> List[str]:
+    """
+    grabbing RTC keyword list from the "keywords" sheet (first column).
+    returns a cleaned, deduplicated list of keywords (og_rtc_kw).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Keyword file not found: {file_path}")
+
+    df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+
+    if first_col_index not in df.columns:
+        raise ValueError(f"Column index {first_col_index} not found in sheet {sheet_name}")
+
+    # split multi-keyword cells by comma and/or semicolon + whitespace
+    og_rtc_kw = []
+    for raw_cell in df.iloc[:, first_col_index].dropna().astype(str):
+        raw_cell = raw_cell.strip()
+        if not raw_cell:
+            continue
+
+        parts = re.split(r",\s*|;\s*", raw_cell)
+        for part in parts:
+            kw = part.strip()
+            if kw:
+                og_rtc_kw.append(kw)
+
+    # maintaining unique order (case insensitive dedupe)
+    seen = set()
+    og_rtc_kw_unique = []
+    for kw in og_rtc_kw:
+        norm_kw = kw.lower()
+        if norm_kw not in seen:
+            seen.add(norm_kw)
+            og_rtc_kw_unique.append(kw)
+    og_rtc_kw = og_rtc_kw_unique
+
+    return og_rtc_kw
+
+
+def find_present_rtc_keywords(
+    df: pd.DataFrame,
+    rtc_keywords: List[str],
+    text_column: str = "response_text_original"
+) -> List[str]:
+    """return keywords from rtc_keywords that appear in the data text column"""
+    if text_column not in df.columns:
+        raise ValueError(f"Dataframe does not have expected column: {text_column}")
+
+    text_series = df[text_column].dropna().astype(str).str.lower()
+
+    normalized_kw = [kw.strip().lower() for kw in rtc_keywords if kw.strip()]
+    present_rtc_kw = []
+
+    for kw in normalized_kw:
+        if not kw:
+            continue
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if text_series.str.contains(pattern, regex=True).any():
+            present_rtc_kw.append(kw)
+
+    return present_rtc_kw
+
+
 # =============================================================================
-# STEP 2: PREPROCESS - clean and normalize text
+# STEP 2: PREPROCESS - clean and normalize text (need to skip now since sentiment analysis + keyword extraction needs more to work with)
 # =============================================================================
 
 def preprocess_text(text: str, stop_words: set, lemmatizer) -> str:
@@ -377,6 +448,14 @@ def add_sentiment_analysis(df: pd.DataFrame) -> pd.DataFrame:
 # STEP 4: KEYWORDS - extract key phrases
 # =============================================================================
 
+def get_seed_keywords():
+    """
+    Returns a set of seed keywords to prioritize in extraction.
+    This can be expanded based on domain knowledge or common themes in the data.
+    """
+    
+    return SEED_KEYWORDS   
+
 def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int]:
     """
     extracting keyword phrases from text using RAKE algorithm.
@@ -391,6 +470,7 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
     if not text or len(text) < 3:
         return {}
     
+    # need to be using nltk stopwords + lemmatizer here since the keyword extraction relies on them for cleaner results
     try:
         rake = _get_rake()
         rake.extract_keywords_from_text(text)
@@ -399,8 +479,8 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
         keyword_dict = {}
         for phrase in phrases:
             phrase = phrase.strip()
-            if len(phrase) < 3:
-                continue  # ignore super short junk
+            # if len(phrase) < 3:
+            #     continue 
             
             # Skip excluded generic keywords
             phrase_lower = phrase.lower()
