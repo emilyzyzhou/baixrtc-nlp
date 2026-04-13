@@ -9,6 +9,7 @@ from nltk.stem import WordNetLemmatizer
 from rake_nltk import Rake
 from datetime import datetime
 from collections import Counter
+import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -20,6 +21,21 @@ except ImportError:
     VADER_AVAILABLE = False
     print("[WARN] vaderSentiment not installed. Using basic sentiment analysis.")
     print("       Install with: pip install vaderSentiment")
+
+# ── Embedding libraries (sentence-transformers primary, GloVe fallback) ──
+EMBEDDING_METHOD = None  # set during init: "sbert" | "glove" | None
+
+try:
+    from sentence_transformers import SentenceTransformer, util as sbert_util
+    SBERT_AVAILABLE = True
+except ImportError:
+    SBERT_AVAILABLE = False
+
+try:
+    import gensim.downloader as gensim_api
+    GENSIM_AVAILABLE = True
+except ImportError:
+    GENSIM_AVAILABLE = False
 
 
 # =============================================================================
@@ -47,6 +63,13 @@ SENTIMENT_ANALYZER = None
 KEYWORD_EXTRACTION_ERROR_SHOWN = False
 RAKE_INSTANCE = None
 
+# ── Embedding globals ──
+SBERT_MODEL = None
+GLOVE_MODEL = None
+RTC_EMBEDDINGS = None        # precomputed embeddings for RTC keywords
+RTC_KEYWORDS_LIST = None     # flat list of RTC keywords (parallel to RTC_EMBEDDINGS)
+SIMILARITY_THRESHOLD = 0.35  # cosine similarity cutoff (tunable)
+
 # Keywords to exclude from analysis (generic responses)
 EXCLUDED_KEYWORDS = {
     "yes", "no", "maybe", "perhaps", "sure", "okay", "ok", "alright", "fine", "good",
@@ -67,7 +90,7 @@ SEED_KEYWORDS = {
 # STEP 0: setup helpers
 # =============================================================================
 
-def _ensure_nltk(): #fixed this to check for all required resources at once
+def _ensure_nltk():
     resources = [
         ("corpora/stopwords", "stopwords"),
         ("corpora/wordnet", "wordnet"),
@@ -99,22 +122,165 @@ def _get_rake():
     global RAKE_INSTANCE
     if RAKE_INSTANCE is None:
         _ensure_nltk()
-        RAKE_INSTANCE = Rake()  # default English stopwords + punkt
+        RAKE_INSTANCE = Rake()
     return RAKE_INSTANCE
+
+
+# =============================================================================
+# EMBEDDING HELPERS  (NEW)
+# =============================================================================
+
+def _init_embedding_model():
+    """
+    Try sentence-transformers first (best for multi-word phrases),
+    fall back to GloVe via gensim, or disable similarity filtering.
+    """
+    global EMBEDDING_METHOD, SBERT_MODEL, GLOVE_MODEL
+
+    if EMBEDDING_METHOD is not None:
+        return  # already initialised
+
+    # ── attempt 1: sentence-transformers ──
+    if SBERT_AVAILABLE:
+        try:
+            print("  [EMBED] Loading sentence-transformers model (all-MiniLM-L6-v2)...")
+            SBERT_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+            EMBEDDING_METHOD = "sbert"
+            print("  [EMBED] sentence-transformers ready.")
+            return
+        except Exception as e:
+            print(f"  [EMBED] sentence-transformers failed: {e}")
+
+    # ── attempt 2: GloVe via gensim ──
+    if GENSIM_AVAILABLE:
+        try:
+            print("  [EMBED] Loading GloVe vectors (glove-wiki-gigaword-100)...")
+            GLOVE_MODEL = gensim_api.load("glove-wiki-gigaword-100")
+            EMBEDDING_METHOD = "glove"
+            print("  [EMBED] GloVe ready.")
+            return
+        except Exception as e:
+            print(f"  [EMBED] GloVe failed: {e}")
+
+    # ── nothing available ──
+    EMBEDDING_METHOD = None
+    print("  [EMBED] No embedding model available. Keyword filtering will use exact match only.")
+    print("          Install with: pip install sentence-transformers   (recommended)")
+    print("          Or:           pip install gensim")
+
+
+def _embed_text(text: str) -> Optional[np.ndarray]:
+    """
+    Return a normalised embedding vector for *text*.
+    Uses whichever model was loaded by _init_embedding_model().
+    """
+    if EMBEDDING_METHOD == "sbert":
+        vec = SBERT_MODEL.encode(text, convert_to_numpy=True)
+        return vec / (np.linalg.norm(vec) + 1e-10)
+
+    if EMBEDDING_METHOD == "glove":
+        # average word vectors for the phrase
+        tokens = text.lower().split()
+        vecs = [GLOVE_MODEL[t] for t in tokens if t in GLOVE_MODEL]
+        if not vecs:
+            return None
+        avg = np.mean(vecs, axis=0)
+        return avg / (np.linalg.norm(avg) + 1e-10)
+
+    return None
+
+
+def _embed_batch(texts: List[str]) -> np.ndarray:
+    """
+    Batch-embed a list of texts. Returns matrix of shape (N, dim).
+    Falls back to one-by-one for GloVe.
+    """
+    if EMBEDDING_METHOD == "sbert":
+        vecs = SBERT_MODEL.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-10
+        return vecs / norms
+
+    # GloVe path (or None path — returns zeros)
+    results = []
+    for t in texts:
+        v = _embed_text(t)
+        if v is not None:
+            results.append(v)
+        else:
+            results.append(np.zeros(100))  # GloVe-100d zero vec
+    return np.array(results)
+
+
+def precompute_rtc_embeddings(rtc_keywords: List[str]):
+    """
+    Build the embedding matrix for the RTC keyword list once.
+    Called after loading the RTC keywords and after the embedding model is ready.
+    """
+    global RTC_EMBEDDINGS, RTC_KEYWORDS_LIST
+
+    _init_embedding_model()
+
+    if EMBEDDING_METHOD is None:
+        RTC_KEYWORDS_LIST = rtc_keywords
+        RTC_EMBEDDINGS = None
+        return
+
+    RTC_KEYWORDS_LIST = rtc_keywords
+    RTC_EMBEDDINGS = _embed_batch(rtc_keywords)
+    print(f"  [EMBED] Precomputed embeddings for {len(rtc_keywords)} RTC keywords "
+          f"(method={EMBEDDING_METHOD}, dim={RTC_EMBEDDINGS.shape[1]})")
+
+
+def keyword_similarity_to_rtc(keyword: str) -> Tuple[float, str]:
+    """
+    Return (max_cosine_similarity, closest_rtc_keyword) for *keyword*
+    against the precomputed RTC embeddings.
+    """
+    if RTC_EMBEDDINGS is None or EMBEDDING_METHOD is None:
+        return 0.0, ""
+
+    kw_vec = _embed_text(keyword)
+    if kw_vec is None:
+        return 0.0, ""
+
+    # cosine similarities (vectors are already normalised)
+    sims = RTC_EMBEDDINGS @ kw_vec
+    best_idx = int(np.argmax(sims))
+    return float(sims[best_idx]), RTC_KEYWORDS_LIST[best_idx]
+
+
+def filter_keywords_by_rtc_similarity(
+    keyword_dict: Dict[str, int],
+    threshold: Optional[float] = None
+) -> Dict[str, int]:
+    """
+    Keep only keywords whose embedding similarity to at least one RTC keyword
+    meets the threshold.  If no embedding model is loaded, passes through unchanged.
+
+    Returns filtered dict AND prints debug info for transparency.
+    """
+    if RTC_EMBEDDINGS is None or EMBEDDING_METHOD is None:
+        return keyword_dict  # no filtering possible
+
+    if threshold is None:
+        threshold = SIMILARITY_THRESHOLD
+
+    filtered = {}
+    for kw, freq in keyword_dict.items():
+        sim, closest = keyword_similarity_to_rtc(kw)
+        if sim >= threshold:
+            filtered[kw] = freq
+
+    return filtered
 
 
 # =============================================================================
 # STEP 1: INGEST - load and transform data
 # =============================================================================
 
-'''Extracts each sheet from source into df, returned as list of dfs'''
 def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     """
     Load survey data and transform from wide to long format.
-     - long format: each row is a single response to a single question, easier for sentiment analysis
-    
-    folder: path to data folder containing excel/CSV files
-    returns: long-format df with standardized columns
     """
     print("\n[STEP 1/5] INGEST - loading and transforming data...")
     all_responses = []
@@ -124,37 +290,30 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     
     response_id = 1
     
-    # process all xlsx files in data folder
     for file in os.listdir(folder):
         file_path = os.path.join(folder, file)
         
-        # skipping directories and processed files
         if os.path.isdir(file_path) or "processed" in file.lower():
             continue
         
-        # process excel files
         if file.lower().endswith(".xlsx"):
             try:
                 xl_file = pd.ExcelFile(file_path)
                 
                 for sheet_name in xl_file.sheet_names:
-                    # skip excluded sheets
                     if any(excl in sheet_name.lower() for excl in SHEETS_TO_EXCLUDE):
                         print(f"  [SKIP] Excluded sheet: {sheet_name}")
                         continue
                     
                     df = pd.read_excel(xl_file, sheet_name=sheet_name)
                     
-                    # update: transforming each column from wide to long format for easier sentiment analysis
                     for col in df.columns:
                         normalized_col = re.sub(r"\s+", " ", str(col)).strip().lower()
-                        if normalized_col in {"sheet name", "sheetname", "sheet_name"}: #this question is metadata not a real question (skews the number of neutral responses)
+                        if normalized_col in {"sheet name", "sheetname", "sheet_name"}:
                             continue
-                        # skip empty columns
                         if df[col].isna().all():
                             continue
                         
-                        # each non-empty cell becomes a response
                         for idx, value in df[col].items():
                             if pd.notna(value) and str(value).strip():
                                 all_responses.append({
@@ -172,12 +331,10 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
             except Exception as e:
                 print(f"  [ERROR] Failed to load {file}: {e}")
         
-        # process csv files
         elif file.lower().endswith(".csv"):
             try:
                 df = pd.read_csv(file_path)
                 
-                # transform from wide to long
                 for col in df.columns:
                     normalized_col = re.sub(r"\s+", " ", str(col)).strip().lower()
                     if normalized_col in {"sheet name", "sheetname", "sheet_name"}:
@@ -204,10 +361,8 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     if not all_responses:
         raise ValueError(f"No data loaded from {folder}")
     
-    # create long-format dataframe
     long_df = pd.DataFrame(all_responses)
     
-    # adding ids for questions and surveys
     unique_questions = long_df['question_text'].unique()
     question_id_map = {q: i+1 for i, q in enumerate(unique_questions)}
     long_df['question_id'] = long_df['question_text'].map(question_id_map)
@@ -216,10 +371,8 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     survey_id_map = {s: i+1 for i, s in enumerate(unique_sheets)}
     long_df['survey_id'] = long_df['sheet_name'].map(survey_id_map)
     
-    # add processing timestamp
     long_df['timestamp'] = datetime.now()
     
-    # reorder columns for clarity
     long_df = long_df[[
         'response_id', 'survey_id', 'question_id', 
         'question_text', 'response_text', 
@@ -232,6 +385,50 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     print(f"    • unique surveys/sheets: {len(unique_sheets)}")
     
     return long_df
+
+
+def load_rtc_keywords_from_csv(file_path: str) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Load RTC keywords from the keywords CSV.
+    Left column = keywords (comma-separated), right column = category.
+
+    Returns:
+        rtc_keywords: flat deduplicated list of individual keywords
+        keyword_to_category: mapping from each keyword to its RTC category
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Keyword file not found: {file_path}")
+
+    df = pd.read_csv(file_path, header=None, names=["keywords_raw", "category"])
+
+    rtc_keywords = []
+    keyword_to_category = {}
+    seen = set()
+
+    for _, row in df.iterrows():
+        raw = str(row["keywords_raw"]).strip()
+        category = str(row.get("category", "")).strip()
+        if not raw or raw.lower() == "nan":
+            continue
+
+        # split on comma/semicolon
+        parts = re.split(r"[,;]\s*", raw)
+        for part in parts:
+            kw = part.strip()
+            # strip parenthetical notes like "(resume)" and trailing markers like "etc."
+            kw = re.sub(r"\(.*?\)", "", kw).strip()
+            kw = re.sub(r"\betc\.?\s*$", "", kw).strip()
+            kw = re.sub(r"\?\?+\s*$", "", kw).strip()
+            if not kw:
+                continue
+            norm = kw.lower()
+            if norm not in seen:
+                seen.add(norm)
+                rtc_keywords.append(kw)
+                if category and category.lower() != "nan":
+                    keyword_to_category[norm] = category
+
+    return rtc_keywords, keyword_to_category
 
 
 def load_rtc_keywords_from_excel(
@@ -251,7 +448,6 @@ def load_rtc_keywords_from_excel(
     if first_col_index not in df.columns:
         raise ValueError(f"Column index {first_col_index} not found in sheet {sheet_name}")
 
-    # split multi-keyword cells by comma and/or semicolon + whitespace
     og_rtc_kw = []
     for raw_cell in df.iloc[:, first_col_index].dropna().astype(str):
         raw_cell = raw_cell.strip()
@@ -264,7 +460,6 @@ def load_rtc_keywords_from_excel(
             if kw:
                 og_rtc_kw.append(kw)
 
-    # maintaining unique order (case insensitive dedupe)
     seen = set()
     og_rtc_kw_unique = []
     for kw in og_rtc_kw:
@@ -302,30 +497,16 @@ def find_present_rtc_keywords(
 
 
 # =============================================================================
-# STEP 2: PREPROCESS - clean and normalize text (need to skip now since sentiment analysis + keyword extraction needs more to work with)
+# STEP 2: PREPROCESS - clean and normalize text
 # =============================================================================
 
 def preprocess_text(text: str, stop_words: set, lemmatizer) -> str:
-    """
-    - convert to lowercase
-    - remove punctuation
-    - remove stopwords
-    - lemmatize words
-    
-    text: input text
-    stop_words: set of stopwords to remove
-    lemmatizer: NLTK lemmatizer
-    """
     if not isinstance(text, str):
         text = str(text) if text is not None else ""
     
-    # lowercase
     text = text.lower()
-    
-    # remove punctuation (Unicode-aware)
     text = re.sub(r'\p{P}+', ' ', text, flags=re.UNICODE)
     
-    # tokenize, remove stopwords, and lemmatize
     tokens = text.split()
     tokens = [t for t in tokens if t and t not in stop_words]
     tokens = [lemmatizer.lemmatize(t) for t in tokens]
@@ -334,9 +515,6 @@ def preprocess_text(text: str, stop_words: set, lemmatizer) -> str:
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    preprocessing all text columns in df
-    """
     print("\n[STEP 2/5] PREPROCESS - Cleaning and normalizing text...")
     
     global STOP_WORDS, LEMMATIZER
@@ -348,14 +526,11 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     
     cleaned_df = df.copy()
     
-    # store original text before cleaning
     cleaned_df['question_text_original'] = cleaned_df['question_text']
     cleaned_df['response_text_original'] = cleaned_df['response_text']
     
-    # store metrics before cleaning
     cleaned_df['response_length'] = cleaned_df['response_text'].str.len()
     
-    # clean text
     cleaned_df['question_text'] = cleaned_df['question_text'].apply(
         lambda t: preprocess_text(t, STOP_WORDS, LEMMATIZER)
     )
@@ -363,7 +538,6 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         lambda t: preprocess_text(t, STOP_WORDS, LEMMATIZER)
     )
     
-    # add word count (after cleaning)
     cleaned_df['word_count'] = cleaned_df['response_text'].str.split().str.len()
     
     print(f"  Preprocessed {len(cleaned_df):,} responses")
@@ -378,11 +552,6 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def analyze_sentiment(text: str) -> Tuple[float, str]:
-    """
-    returns tuple of (sentiment_score, sentiment_label)
-        - score: -1 (negative) to +1 (positive)
-        - label: "positive", "negative", or "neutral"
-    """
     if not text or not isinstance(text, str) or text.strip() == "":
         return 0.0, "neutral"
     
@@ -391,7 +560,6 @@ def analyze_sentiment(text: str) -> Tuple[float, str]:
         scores = analyzer.polarity_scores(text)
         compound = scores['compound']
         
-        # classifying based on compound score
         if compound >= 0.05:
             label = "positive"
         elif compound <= -0.05:
@@ -401,7 +569,6 @@ def analyze_sentiment(text: str) -> Tuple[float, str]:
         
         return compound, label
     else:
-        # if vader fails, use simple keyword matching
         positive_words = {
             'good', 'great', 'excellent', 'positive', 'love', 'best', 
             'happy', 'thank', 'amazing', 'wonderful', 'helpful', 'useful'
@@ -424,14 +591,10 @@ def analyze_sentiment(text: str) -> Tuple[float, str]:
 
 
 def add_sentiment_analysis(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    updates df with sentiment_score and sentiment_label columns
-    """
     print("\n[STEP 3/5] SENTIMENT - analyzing sentiment...")
     
     df_with_sentiment = df.copy()
     
-    # using (uncleaned) text for better sentiment analysis
     sentiment_results = df_with_sentiment["response_text_original"].apply(analyze_sentiment)
     df_with_sentiment["sentiment_score"] = sentiment_results.apply(lambda x: x[0])
     df_with_sentiment["sentiment_label"] = sentiment_results.apply(lambda x: x[1])
@@ -449,19 +612,12 @@ def add_sentiment_analysis(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def get_seed_keywords():
-    """
-    Returns a set of seed keywords to prioritize in extraction.
-    This can be expanded based on domain knowledge or common themes in the data.
-    """
-    
     return SEED_KEYWORDS   
 
 def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int]:
     """
-    extracting keyword phrases from text using RAKE algorithm.
-    text: Input text
-    max_phrases: Maximum number of phrases to extract
-    returns: Dictionary mapping keywords to their frequency counts
+    Extract keyword phrases from text using RAKE, then filter by embedding
+    similarity to the RTC keyword list (if embeddings are available).
     """
     if text is None or not isinstance(text, str):
         return {}
@@ -470,7 +626,6 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
     if not text or len(text) < 3:
         return {}
     
-    # need to be using nltk stopwords + lemmatizer here since the keyword extraction relies on them for cleaner results
     try:
         rake = _get_rake()
         rake.extract_keywords_from_text(text)
@@ -479,20 +634,19 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
         keyword_dict = {}
         for phrase in phrases:
             phrase = phrase.strip()
-            # if len(phrase) < 3:
-            #     continue 
             
-            # Skip excluded generic keywords
             phrase_lower = phrase.lower()
             if phrase_lower in EXCLUDED_KEYWORDS:
                 continue
             
-            # count how many times this phrase appears in the text
             count = text.lower().count(phrase.lower())
             if count > 0:
                 keyword_dict[phrase] = count
             if len(keyword_dict) >= max_phrases:
                 break
+
+        # ── NEW: filter RAKE keywords by similarity to RTC keywords ──
+        keyword_dict = filter_keywords_by_rtc_similarity(keyword_dict)
         
         return keyword_dict
     except Exception as e:
@@ -510,24 +664,22 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
         if not tokens:
             return {}
         counts = Counter(tokens)
-        return dict(counts.most_common(max_phrases))
+        raw = dict(counts.most_common(max_phrases))
+
+        # apply similarity filter to fallback too
+        return filter_keywords_by_rtc_similarity(raw)
 
 
 def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    add keywords column to df (stored as JSON with frequency counts)
-    """
     print("\n[STEP 4/5] KEYWORDS - Extracting key phrases...")
     
     df_with_keywords = df.copy()
     
-    # using uncleaned text for better keyword extraction
     df_with_keywords["keywords"] = df_with_keywords["response_text_original"].apply(
         lambda t: json.dumps(extract_keywords(t))
     )
     
-    # count non-empty keyword extractions
-    non_empty = (df_with_keywords["keywords"].str.len() > 2).sum()  # {} is 2 chars
+    non_empty = (df_with_keywords["keywords"].str.len() > 2).sum()
     print(f"  extracted keywords from {non_empty:,} responses ({non_empty/len(df_with_keywords)*100:.1f}%)")
     
     return df_with_keywords
@@ -540,22 +692,15 @@ def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
 def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
     """
     Generate summary statistics grouped by question with keywords expanded to separate rows.
-
-    To allow Tableau to better aggregate keywords, creates one row per keyword per question.
-
-    Output format:
-    - One row per question-keyword combination
-    - Tableau can easily count, filter, and visualize keywords across questions
+    Keywords are already filtered by RTC similarity during extraction.
     """
     print("\n[STEP 5/5] EXPORT - generating summaries...")
 
     summary_data = []
 
-    # Group by question
     grouped = df.groupby(["question_id", "question_text_original"])
 
     for (qid, qtext), group in grouped:
-        # Calculate base question statistics (same for all keywords in this question)
         base_stats = {
             "question_id": qid,
             "question_text": qtext,
@@ -564,7 +709,6 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
             "avg_word_count": round(group["word_count"].mean(), 2),
         }
 
-        # Add sentiment statistics
         if "sentiment_score" in group.columns:
             base_stats.update({
                 "avg_sentiment_score": round(group["sentiment_score"].mean(), 2),
@@ -574,19 +718,15 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
                 "neutral_responses": (group["sentiment_label"] == "neutral").sum(),
             })
 
-        # Survey sources (same for all keywords in this question)
         base_stats["survey_sources"] = ", ".join(group["sheet_name"].unique())
 
-        # Extract and aggregate keywords across all responses for this question
         all_keywords = Counter()
         for text in group["response_text_original"].dropna():
             kw_dict = extract_keywords(text)
             all_keywords.update(kw_dict)
 
-        # Get top 10 keywords with frequencies
         top_keywords = all_keywords.most_common(10)
 
-        # Create one row per keyword (long format for Tableau)
         if top_keywords:
             for keyword, frequency in top_keywords:
                 keyword_row = base_stats.copy()
@@ -594,7 +734,6 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
                 keyword_row["frequency"] = frequency
                 summary_data.append(keyword_row)
         else:
-            # If no keywords found, still create one row with empty keyword
             keyword_row = base_stats.copy()
             keyword_row["keyword"] = ""
             keyword_row["frequency"] = 0
@@ -602,7 +741,6 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
 
     summary_df = pd.DataFrame(summary_data)
 
-    # Sort by question_id, then by frequency (most frequent keywords first)
     summary_df = summary_df.sort_values(["question_id", "frequency"], ascending=[True, False])
 
     print(f"  Generated {len(summary_df):,} keyword rows for {len(summary_df['question_id'].unique())} questions")
@@ -614,45 +752,35 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
 def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -> None:
     """
     Generate a simple keywords CSV where each keyword appears as many times as its frequency.
-    This creates a single-column CSV perfect for simple word cloud tools.
-
-    Filters out generic keywords and responses from yes/no questions for more meaningful topics.
+    Keywords are already filtered by RTC similarity during extraction.
     """
     print("\n[STEP 5.5] EXPORT - generating keywords CSV...")
     
-    # Filter out responses that are likely from yes/no questions
-    # Exclude questions with very short average responses (likely yes/no)
     question_stats = df.groupby('question_id').agg({
         'response_length': 'mean',
         'response_text_original': 'count'
     }).reset_index()
     
-    # Keep only questions with average response length > 10 characters
     meaningful_questions = question_stats[question_stats['response_length'] > 10]['question_id']
     df_filtered = df[df['question_id'].isin(meaningful_questions)]
     
     print(f"  Filtered to {len(df_filtered):,} responses from {len(meaningful_questions)} meaningful questions")
     
-    # Aggregate keywords across filtered responses
     all_keywords = Counter()
     
     for text in df_filtered["response_text_original"].dropna():
         kw_dict = extract_keywords(text)
         all_keywords.update(kw_dict)
     
-    # Get top 10 keywords
     top_keywords = all_keywords.most_common(10)
     
-    # Create DataFrame where each keyword appears frequency times
     keyword_rows = []
     for keyword, frequency in top_keywords:
-        # Add 'frequency' number of rows for this keyword
         for _ in range(frequency):
             keyword_rows.append({"keyword": keyword})
 
     keywords_df = pd.DataFrame(keyword_rows)
 
-    # Save to CSV
     keywords_path = os.path.join(output_folder, "keywords.csv")
     try:
         keywords_df.to_csv(keywords_path, index=False)
@@ -671,32 +799,77 @@ def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -
 
 def run_pipeline(
     data_folder: str = "data",
-    output_folder: str = "data/final"
+    output_folder: str = "data/final",
+    rtc_keywords_file: Optional[str] = None,
+    similarity_threshold: float = 0.35
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     data_folder: path to input data folder
     output_folder: path to output folder
+    rtc_keywords_file: path to CSV with RTC keywords (left column).
+                       If None, looks for 'keywords.csv' in data_folder or
+                       tries to load from the first .xlsx 'keywords' sheet.
+    similarity_threshold: cosine similarity cutoff for filtering RAKE keywords
+                          against RTC keywords. Lower = more permissive.
+                          Recommended range: 0.25–0.50. Default 0.35.
 
     return: tuple of (responses_with_features_df, summary_by_question_df)
     """
+    global SIMILARITY_THRESHOLD
+    SIMILARITY_THRESHOLD = similarity_threshold
+
     print("=" * 80)
     print("BAI SURVEY ANALYSIS PIPELINE")
     print("=" * 80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
     
-    # execute pipeline steps
+    # ── Load RTC keywords ──
+    rtc_keywords = []
+    rtc_categories = {}
+
+    if rtc_keywords_file and os.path.exists(rtc_keywords_file):
+        if rtc_keywords_file.lower().endswith(".csv"):
+            rtc_keywords, rtc_categories = load_rtc_keywords_from_csv(rtc_keywords_file)
+        else:
+            rtc_keywords = load_rtc_keywords_from_excel(rtc_keywords_file)
+        print(f"\n  [RTC] Loaded {len(rtc_keywords)} RTC keywords from {rtc_keywords_file}")
+    else:
+        # auto-discover: check for keywords.csv in data folder
+        csv_candidate = os.path.join(data_folder, "keywords.csv")
+        if os.path.exists(csv_candidate):
+            rtc_keywords, rtc_categories = load_rtc_keywords_from_csv(csv_candidate)
+            print(f"\n  [RTC] Auto-loaded {len(rtc_keywords)} RTC keywords from {csv_candidate}")
+        else:
+            # try to load from first xlsx file's keywords sheet
+            for f in os.listdir(data_folder):
+                if f.lower().endswith(".xlsx"):
+                    try:
+                        rtc_keywords = load_rtc_keywords_from_excel(
+                            os.path.join(data_folder, f), sheet_name="keywords"
+                        )
+                        print(f"\n  [RTC] Auto-loaded {len(rtc_keywords)} RTC keywords from {f}")
+                        break
+                    except Exception:
+                        continue
+
+    # ── Precompute RTC embeddings ──
+    if rtc_keywords:
+        precompute_rtc_embeddings(rtc_keywords)
+    else:
+        print("\n  [RTC] No RTC keywords found — skipping embedding similarity filter.")
+
+    # ── Execute pipeline steps ──
     df = load_and_transform_data(data_folder)
     df = preprocess_dataframe(df)
     df = add_sentiment_analysis(df)
     df = add_keyword_extraction(df)
     df = df.drop(columns=["keywords"])
     summary_df = generate_summary_by_question(df)
-    generate_keywords_csv(df, output_folder)  # Create keywords.csv in output folder
+    generate_keywords_csv(df, output_folder)
     
-    # create output directory
     os.makedirs(output_folder, exist_ok=True)
     
-    # save outputs
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
     
@@ -716,7 +889,6 @@ def run_pipeline(
         print(f"[WARN] Permission denied for summary file. Writing to: {summary_path}")
         summary_df.to_csv(summary_path, index=False)
     
-    # final summary
     print("\n" + "=" * 80)
     print("PIPELINE COMPLETED SUCCESSFULLY!")
     print("=" * 80)
@@ -727,6 +899,8 @@ def run_pipeline(
     print(f"     → {len(summary_df)} questions with aggregated statistics")
     print(f"  3. {os.path.join(output_folder, 'keywords.csv')}")
     print(f"     → Simple keyword list for word clouds")
+    print(f"\nEmbedding method: {EMBEDDING_METHOD or 'none (exact match only)'}")
+    print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nReady for Tableau import!")
     print("=" * 80)
