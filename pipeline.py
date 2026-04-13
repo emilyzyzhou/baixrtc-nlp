@@ -12,6 +12,10 @@ from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 
+# Suppress Hugging Face Hub warnings
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 # vaderSentiment for sentiment analysis
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -534,7 +538,280 @@ def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# STEP 5: EXPORT - Generate summaries and save
+# STEP 5: TOPIC MODELING - Extract and infer topics
+# =============================================================================
+
+def load_provided_topics(
+    file_path: str,
+    sheet_name: str = "keywords"
+) -> List[str]:
+    """
+    Load provided topics from the keywords sheet (second column).
+    These are the actual topics defined by UVA BAI that should be combined
+    with inferred topics from BERTopic.
+    
+    file_path: path to Excel file containing keywords sheet
+    sheet_name: sheet name containing keywords and topics
+    returns: deduplicated list of provided topics
+    """
+    if not os.path.exists(file_path):
+        print(f"[WARN] Keywords file not found: {file_path}. Skipping provided topics.")
+        return []
+    
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        
+        # Second column (index 1) contains topics/categories
+        if df.shape[1] < 2:
+            return []
+        
+        topics = []
+        for topic in df.iloc[:, 1].dropna().astype(str):
+            topic = topic.strip()
+            if topic:
+                topics.append(topic)
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_topics = []
+        for topic in topics:
+            if topic.lower() not in seen:
+                seen.add(topic.lower())
+                unique_topics.append(topic)
+        
+        return unique_topics
+    except Exception as e:
+        print(f"[WARN] Error loading provided topics: {e}")
+        return []
+
+
+def perform_topic_modeling(
+    texts: List[str],
+    num_topics: int = 5,
+    min_topic_size: int = 2,
+    language: str = "english",
+    max_texts: int = 5000
+) -> Tuple:
+    """
+    Perform topic modeling using BERTopic.
+    
+    texts: List of text documents (responses)
+    num_topics: Target number of topics to infer
+    min_topic_size: Minimum size for a topic cluster
+    language: Language for the model
+    max_texts: Maximum number of texts to process (samples if larger)
+    returns: Tuple of (model, topics, probabilities) where:
+        - model: Trained BERTopic model
+        - topics: Topic assignment for each document
+        - probabilities: Probability matrix for each document-topic pair
+    """
+    try:
+        from bertopic import BERTopic
+        from sentence_transformers import SentenceTransformer
+        import logging
+        import random
+        
+        # Suppress verbose logging
+        logging.getLogger('sentence_transformers').setLevel(logging.WARNING)
+        logging.getLogger('transformers').setLevel(logging.WARNING)
+        
+        print("[INFO] Using BERTopic for topic modeling...")
+        
+        # Filter out empty texts
+        valid_texts = [t for t in texts if isinstance(t, str) and t.strip()]
+        
+        if len(valid_texts) < min_topic_size * 2:
+            print(f"[WARN] Not enough text samples ({len(valid_texts)}) for topic modeling. Skipping.")
+            return None, None, None
+        
+        # Sample texts if too many (for faster processing)
+        if len(valid_texts) > max_texts:
+            print(f"  Sampling {max_texts:,} texts from {len(valid_texts):,} for faster processing...")
+            valid_texts = random.sample(valid_texts, max_texts)
+        
+        # Initialize BERTopic model with sentence-transformers
+        print(f"  Loading embedding model...")
+        model = BERTopic(
+            language=language,
+            calculate_probabilities=True,
+            min_topic_size=min_topic_size,
+            nr_topics=num_topics,
+            verbose=False
+        )
+        
+        # Fit model on texts
+        print(f"  Fitting model on {len(valid_texts):,} texts (this may take a few minutes)...")
+        topics, probabilities = model.fit_transform(valid_texts)
+        print(f"  Topic modeling complete. Found {len(set(topics))} distinct topics.")
+        
+        return model, topics, probabilities
+    
+    except ImportError:
+        print("[ERROR] BERTopic not installed. Please run: pip install bertopic sentence-transformers")
+        return None, None, None
+    except Exception as e:
+        print(f"[ERROR] Topic modeling failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
+
+
+def extract_inferred_topics(
+    model,
+    num_topics: int = 5
+) -> List[str]:
+    """
+    Extract inferred topic labels from BERTopic model.
+    
+    model: Trained BERTopic model
+    num_topics: Number of topics to extract
+    returns: List of topic labels/descriptions
+    """
+    if model is None:
+        return []
+    
+    try:
+        topics_dict = model.get_topic_info()
+        # Get top N topics (excluding noise topic -1)
+        valid_topics = topics_dict[topics_dict['Topic'] != -1].head(num_topics)
+        inferred_topics = []
+        
+        for idx, row in valid_topics.iterrows():
+            # Extract top keywords for this topic
+            terms = model.get_topic(row['Topic'])
+            if terms:
+                keywords = ", ".join([term[0] for term in terms[:3]])
+                topic_label = f"Topic: {keywords}"
+                inferred_topics.append(topic_label)
+        
+        return inferred_topics
+    except Exception as e:
+        print(f"[WARN] Error extracting inferred topics: {e}")
+        return []
+
+
+def match_responses_to_topics(
+    df: pd.DataFrame,
+    provided_topics: List[str],
+    inferred_topics: List[str],
+    model=None,
+    topics_array=None,
+    probabilities=None
+) -> pd.DataFrame:
+    """
+    Match each response to relevant topics (both provided and inferred).
+    
+    df: DataFrame with responses
+    provided_topics: List of provided topics from keywords sheet
+    inferred_topics: List of inferred topics from BERTopic
+    model: BERTopic model instance
+    topics_array: Topic assignments from BERTopic
+    probabilities: Probability matrix from BERTopic
+    returns: DataFrame with topic assignments for each response
+    """
+    df_topics = df.copy()
+    
+    # Initialize topic columns
+    all_topics = provided_topics + inferred_topics
+    for topic in all_topics:
+        df_topics[topic] = ""
+    
+    # Process each response
+    for idx, row in df_topics.iterrows():
+        text = str(row['response_text_original']).lower() if pd.notna(row['response_text_original']) else ""
+        
+        if not text:
+            continue
+        
+        # Match provided topics (keyword-based)
+        for topic in provided_topics:
+            # Check if topic keywords appear in response
+            topic_words = topic.lower().split()
+            if any(word in text for word in topic_words):
+                df_topics.at[idx, topic] = row['response_id']
+        
+        # Match inferred topics (probability-based)
+        if model is not None and topics_array is not None and idx < len(topics_array):
+            assigned_topic_idx = topics_array[idx]
+            
+            if assigned_topic_idx >= 0 and assigned_topic_idx < len(inferred_topics):
+                # Add response ID to the assigned topic column
+                topic_col = inferred_topics[assigned_topic_idx]
+                if pd.isna(df_topics.at[idx, topic_col]) or df_topics.at[idx, topic_col] == "":
+                    df_topics.at[idx, topic_col] = row['response_id']
+    
+    return df_topics
+
+
+# =============================================================================
+# STEP 5.5: EXPORT - Additional topic-based outputs
+# =============================================================================
+
+def generate_topics_csv(
+    df: pd.DataFrame,
+    provided_topics: List[str],
+    inferred_topics: List[str],
+    output_folder: str = "data/final"
+) -> None:
+    """
+    Generate topics.csv where each column is a topic and contains
+    all response_ids that relate to that topic.
+    
+    df: DataFrame with topic assignments (from match_responses_to_topics)
+    provided_topics: List of provided topics
+    inferred_topics: List of inferred topics
+    output_folder: Output directory path
+    """
+    print("\n[STEP 5.5] EXPORT - Generating topics.csv...")
+    
+    all_topics = provided_topics + inferred_topics
+    
+    if not all_topics:
+        print("[WARN] No topics found. Skipping topics.csv generation.")
+        return
+    
+    # Create topics CSV with clean response data
+    topic_data = {}
+    
+    for topic in all_topics:
+        if topic in df.columns:
+            # Get all non-empty response IDs for this topic
+            responses = df[topic].dropna()
+            responses = responses[responses != ""]
+            # Convert to list of response_ids with their actual text for context
+            topic_data[topic] = responses.tolist()
+    
+    # Find max length for consistent row count
+    max_responses = max(len(v) for v in topic_data.values()) if topic_data else 0
+    
+    # Create DataFrame with topics as columns and response IDs as values
+    topics_output = {}
+    for topic, response_ids in topic_data.items():
+        # Pad with empty strings to match max length
+        padded = response_ids + [""] * (max_responses - len(response_ids))
+        topics_output[topic] = padded
+    
+    topics_df = pd.DataFrame(topics_output)
+    
+    # Save to CSV
+    topics_path = os.path.join(output_folder, "topics.csv")
+    try:
+        topics_df.to_csv(topics_path, index=False)
+        print(f"  Saved {len(topics_df.columns)} topics to {topics_path}")
+        print(f"    • Topics: {len(provided_topics)} provided + {len(inferred_topics)} inferred")
+        for topic in all_topics:
+            if topic in topics_df.columns:
+                count = (topics_df[topic] != "").sum()
+                print(f"    • {topic}: {count} responses")
+    except Exception as e:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        topics_path = os.path.join(output_folder, f"topics_{ts}.csv")
+        print(f"[WARN] Error writing topics file. Trying alternative path: {topics_path}")
+        topics_df.to_csv(topics_path, index=False)
+
+
+# =============================================================================
+# STEP 6: EXPORT - Generate summaries and save
 # =============================================================================
 
 def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
@@ -671,11 +948,15 @@ def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -
 
 def run_pipeline(
     data_folder: str = "data",
-    output_folder: str = "data/final"
+    output_folder: str = "data/final",
+    excel_file: str = "data/UVA BAI Unstructured Data.xlsx",
+    num_topics: int = 5
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     data_folder: path to input data folder
     output_folder: path to output folder
+    excel_file: path to Excel file containing keywords/topics sheet
+    num_topics: number of topics to infer with BERTopic
 
     return: tuple of (responses_with_features_df, summary_by_question_df)
     """
@@ -690,8 +971,40 @@ def run_pipeline(
     df = add_sentiment_analysis(df)
     df = add_keyword_extraction(df)
     df = df.drop(columns=["keywords"])
+    
+    # Task 21: Load provided topics and perform topic modeling
+    print("\n[TASK 21] TOPIC MODELING - Inferring topics from responses...")
+    provided_topics = load_provided_topics(excel_file)
+    print(f"  Loaded {len(provided_topics)} provided topics from keywords sheet")
+    
+    # Perform BERTopic modeling on response texts
+    model, topics_array, probabilities = perform_topic_modeling(
+        texts=df['response_text_original'].fillna("").tolist(),
+        num_topics=num_topics
+    )
+    
+    inferred_topics = []
+    if model is not None:
+        inferred_topics = extract_inferred_topics(model, num_topics=num_topics)
+        print(f"  Inferred {len(inferred_topics)} topics from response texts")
+    
+    # Match responses to topics (Task 21 & 22 setup)
+    print("\n[TASK 21/22] TOPIC ASSIGNMENT - Matching responses to topics...")
+    df_with_topics = match_responses_to_topics(
+        df,
+        provided_topics,
+        inferred_topics,
+        model=model,
+        topics_array=topics_array,
+        probabilities=probabilities
+    )
+    
     summary_df = generate_summary_by_question(df)
-    generate_keywords_csv(df, output_folder)  # Create keywords.csv in output folder
+    generate_keywords_csv(df, output_folder)
+    
+    # Task 22: Generate topics.csv
+    print("\n[TASK 22] TOPIC AGGREGATION - Creating topics.csv...")
+    generate_topics_csv(df_with_topics, provided_topics, inferred_topics, output_folder)
     
     # create output directory
     os.makedirs(output_folder, exist_ok=True)
@@ -727,6 +1040,8 @@ def run_pipeline(
     print(f"     → {len(summary_df)} questions with aggregated statistics")
     print(f"  3. {os.path.join(output_folder, 'keywords.csv')}")
     print(f"     → Simple keyword list for word clouds")
+    print(f"  4. {os.path.join(output_folder, 'topics.csv')}")
+    print(f"     → Topic assignments ({len(provided_topics)} provided + {len(inferred_topics)} inferred topics)")
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nReady for Tableau import!")
     print("=" * 80)
