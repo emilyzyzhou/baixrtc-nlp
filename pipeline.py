@@ -69,6 +69,7 @@ GLOVE_MODEL = None
 RTC_EMBEDDINGS = None        # precomputed embeddings for RTC keywords
 RTC_KEYWORDS_LIST = None     # flat list of RTC keywords (parallel to RTC_EMBEDDINGS)
 SIMILARITY_THRESHOLD = 0.35  # cosine similarity cutoff (tunable)
+KEYWORD_CACHE = {}               # text -> filtered keyword dict (avoids recomputation)
 
 # Keywords to exclude from analysis (generic responses)
 EXCLUDED_KEYWORDS = {
@@ -255,21 +256,31 @@ def filter_keywords_by_rtc_similarity(
 ) -> Dict[str, int]:
     """
     Keep only keywords whose embedding similarity to at least one RTC keyword
-    meets the threshold.  If no embedding model is loaded, passes through unchanged.
-
-    Returns filtered dict AND prints debug info for transparency.
+    meets the threshold.  Uses batch embedding for speed.
+    If no embedding model is loaded, passes through unchanged.
     """
     if RTC_EMBEDDINGS is None or EMBEDDING_METHOD is None:
         return keyword_dict  # no filtering possible
 
+    if not keyword_dict:
+        return keyword_dict
+
     if threshold is None:
         threshold = SIMILARITY_THRESHOLD
 
+    keywords = list(keyword_dict.keys())
+
+    # batch-embed all RAKE keywords at once (much faster than one-by-one)
+    kw_embeddings = _embed_batch(keywords)  # shape (N, dim)
+
+    # cosine sims: each keyword against all RTC keywords → take max per keyword
+    sim_matrix = kw_embeddings @ RTC_EMBEDDINGS.T  # shape (N, M)
+    max_sims = sim_matrix.max(axis=1)              # shape (N,)
+
     filtered = {}
-    for kw, freq in keyword_dict.items():
-        sim, closest = keyword_similarity_to_rtc(kw)
-        if sim >= threshold:
-            filtered[kw] = freq
+    for i, kw in enumerate(keywords):
+        if max_sims[i] >= threshold:
+            filtered[kw] = keyword_dict[kw]
 
     return filtered
 
@@ -618,6 +629,7 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
     """
     Extract keyword phrases from text using RAKE, then filter by embedding
     similarity to the RTC keyword list (if embeddings are available).
+    Results are cached so repeated calls with the same text are instant.
     """
     if text is None or not isinstance(text, str):
         return {}
@@ -625,6 +637,10 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
     text = str(text).strip()
     if not text or len(text) < 3:
         return {}
+
+    # ── cache hit → skip RAKE + embedding entirely ──
+    if text in KEYWORD_CACHE:
+        return KEYWORD_CACHE[text]
     
     try:
         rake = _get_rake()
@@ -645,9 +661,10 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
             if len(keyword_dict) >= max_phrases:
                 break
 
-        # ── NEW: filter RAKE keywords by similarity to RTC keywords ──
+        # ── filter RAKE keywords by similarity to RTC keywords ──
         keyword_dict = filter_keywords_by_rtc_similarity(keyword_dict)
         
+        KEYWORD_CACHE[text] = keyword_dict
         return keyword_dict
     except Exception as e:
         global KEYWORD_EXTRACTION_ERROR_SHOWN, STOP_WORDS, LEMMATIZER
@@ -662,12 +679,14 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
         cleaned = preprocess_text(text, STOP_WORDS, LEMMATIZER)
         tokens = [t for t in cleaned.split() if len(t) > 2 and t.lower() not in EXCLUDED_KEYWORDS]
         if not tokens:
+            KEYWORD_CACHE[text] = {}
             return {}
         counts = Counter(tokens)
         raw = dict(counts.most_common(max_phrases))
 
-        # apply similarity filter to fallback too
-        return filter_keywords_by_rtc_similarity(raw)
+        result = filter_keywords_by_rtc_similarity(raw)
+        KEYWORD_CACHE[text] = result
+        return result
 
 
 def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
@@ -720,10 +739,14 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
 
         base_stats["survey_sources"] = ", ".join(group["sheet_name"].unique())
 
+        # ── Reuse keywords already computed in Step 4 (from the "keywords" column) ──
         all_keywords = Counter()
-        for text in group["response_text_original"].dropna():
-            kw_dict = extract_keywords(text)
-            all_keywords.update(kw_dict)
+        for kw_json in group["keywords"].dropna():
+            try:
+                kw_dict = json.loads(kw_json)
+                all_keywords.update(kw_dict)
+            except (json.JSONDecodeError, TypeError):
+                continue
 
         top_keywords = all_keywords.most_common(10)
 
@@ -768,9 +791,13 @@ def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -
     
     all_keywords = Counter()
     
-    for text in df_filtered["response_text_original"].dropna():
-        kw_dict = extract_keywords(text)
-        all_keywords.update(kw_dict)
+    # ── Reuse keywords already computed in Step 4 ──
+    for kw_json in df_filtered["keywords"].dropna():
+        try:
+            kw_dict = json.loads(kw_json)
+            all_keywords.update(kw_dict)
+        except (json.JSONDecodeError, TypeError):
+            continue
     
     top_keywords = all_keywords.most_common(10)
     
@@ -859,16 +886,17 @@ def run_pipeline(
     else:
         print("\n  [RTC] No RTC keywords found — skipping embedding similarity filter.")
 
+    # ── Create output directory before any saving ──
+    os.makedirs(output_folder, exist_ok=True)
+
     # ── Execute pipeline steps ──
     df = load_and_transform_data(data_folder)
     df = preprocess_dataframe(df)
     df = add_sentiment_analysis(df)
     df = add_keyword_extraction(df)
-    df = df.drop(columns=["keywords"])
-    summary_df = generate_summary_by_question(df)
-    generate_keywords_csv(df, output_folder)
-    
-    os.makedirs(output_folder, exist_ok=True)
+    summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
+    generate_keywords_csv(df, output_folder)          # reuses df["keywords"]
+    df = df.drop(columns=["keywords"])                # drop after reuse
     
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
