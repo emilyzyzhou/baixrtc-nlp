@@ -772,35 +772,47 @@ def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
     return summary_df
 
 
-def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -> None:
+def generate_keywords_csv(
+    df: pd.DataFrame,
+    output_folder: str = "data/final",
+    keyword_pool: Counter = None
+) -> None:
     """
     Generate a simple keywords CSV where each keyword appears as many times as its frequency.
-    Keywords are already filtered by RTC similarity during extraction.
+
+    If keyword_pool is provided (Task 20), use the combined filtered_rake_kw + present_rtc_kw.
+    Otherwise (legacy), extract and use top 10 keywords from df["keywords"].
     """
     print("\n[STEP 5.5] EXPORT - generating keywords CSV...")
-    
-    question_stats = df.groupby('question_id').agg({
-        'response_length': 'mean',
-        'response_text_original': 'count'
-    }).reset_index()
-    
-    meaningful_questions = question_stats[question_stats['response_length'] > 10]['question_id']
-    df_filtered = df[df['question_id'].isin(meaningful_questions)]
-    
-    print(f"  Filtered to {len(df_filtered):,} responses from {len(meaningful_questions)} meaningful questions")
-    
-    all_keywords = Counter()
-    
-    # ── Reuse keywords already computed in Step 4 ──
-    for kw_json in df_filtered["keywords"].dropna():
-        try:
-            kw_dict = json.loads(kw_json)
-            all_keywords.update(kw_dict)
-        except (json.JSONDecodeError, TypeError):
-            continue
-    
-    top_keywords = all_keywords.most_common(10)
-    
+
+    if keyword_pool is not None:
+        # Task 20: Use provided combined keyword pool (capped at top 200 for Tableau/word clouds)
+        top_keywords = keyword_pool.most_common(200)
+        print(f"  Using combined keyword pool (top 200 of {len(keyword_pool)} unique keywords)")
+    else:
+        # Legacy: Extract from df["keywords"] (top 10 only)
+        question_stats = df.groupby('question_id').agg({
+            'response_length': 'mean',
+            'response_text_original': 'count'
+        }).reset_index()
+
+        meaningful_questions = question_stats[question_stats['response_length'] > 10]['question_id']
+        df_filtered = df[df['question_id'].isin(meaningful_questions)]
+
+        print(f"  Filtered to {len(df_filtered):,} responses from {len(meaningful_questions)} meaningful questions")
+
+        all_keywords = Counter()
+
+        # ── Reuse keywords already computed in Step 4 ──
+        for kw_json in df_filtered["keywords"].dropna():
+            try:
+                kw_dict = json.loads(kw_json)
+                all_keywords.update(kw_dict)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        top_keywords = all_keywords.most_common(10)
+
     keyword_rows = []
     for keyword, frequency in top_keywords:
         for _ in range(frequency):
@@ -812,7 +824,7 @@ def generate_keywords_csv(df: pd.DataFrame, output_folder: str = "data/final") -
     try:
         keywords_df.to_csv(keywords_path, index=False)
         print(f"  Saved {len(keywords_df):,} keyword instances to {keywords_path}")
-        print(f"  Top keywords: {', '.join([f'{kw}({freq})' for kw, freq in top_keywords])}")
+        print(f"  Top keywords: {', '.join([f'{kw}({freq})' for kw, freq in top_keywords[:10]])}")
     except PermissionError:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         keywords_path = os.path.join(output_folder, f"keywords_{ts}.csv")
@@ -894,8 +906,36 @@ def run_pipeline(
     df = preprocess_dataframe(df)
     df = add_sentiment_analysis(df)
     df = add_keyword_extraction(df)
+
+    # ── Task 20: Aggregate filtered RAKE keywords and combine with present RTC keywords 
+    # STUB: filtered_rake_kw aggregated from df["keywords"] below
+    filtered_rake_kw = Counter()
+    for kw_json in df["keywords"].dropna():
+        try:
+            kw_dict = json.loads(kw_json)
+            filtered_rake_kw.update(kw_dict)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Get RTC keywords that are actually present in the data
+    present_rtc_kw = find_present_rtc_keywords(df, rtc_keywords, text_column="response_text_original")
+
+    # Combine both keyword lists
+    combined_keywords = Counter(filtered_rake_kw)  # Start with RAKE keywords
+    seen_lower = {k.lower() for k in filtered_rake_kw.keys()}
+
+    # Add present_rtc_kw that aren't already in RAKE pool
+    for rtc_kw in present_rtc_kw:
+        if rtc_kw.lower() not in seen_lower:
+            # Count actual occurrences in response text
+            pattern = r"\b" + re.escape(rtc_kw.lower()) + r"\b"
+            count = sum(1 for text in df["response_text_original"].dropna().astype(str)
+                       if re.search(pattern, text.lower()))
+            if count > 0:
+                combined_keywords[rtc_kw] = count
+
     summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
-    generate_keywords_csv(df, output_folder)          # reuses df["keywords"]
+    generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
     df = df.drop(columns=["keywords"])                # drop after reuse
     
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
