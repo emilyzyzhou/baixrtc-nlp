@@ -13,6 +13,10 @@ import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
+# Suppress Hugging Face Hub warnings
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 # vaderSentiment for sentiment analysis
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -734,13 +738,282 @@ def add_keyword_extraction(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# STEP 5: EXPORT - Generate summaries and save
+# STEP 5: TOPIC MODELING - Extract and infer topics
+# =============================================================================
+
+def load_provided_topics(
+    file_path: str,
+    sheet_name: str = "keywords"
+) -> List[str]:
+    """
+    Load provided topics from the keywords sheet (first column).
+    Uses load_rtc_keywords_from_excel() which handles comma-separated keywords.
+
+    file_path: path to Excel file containing keywords sheet
+    sheet_name: sheet name containing keywords data
+    returns: deduplicated list of provided topics (individual keywords/phrases)
+    """
+    if not os.path.exists(file_path):
+        print(f"[WARN] Keywords file not found: {file_path}. Skipping provided topics.")
+        return []
+
+    try:
+        # Use existing load_rtc_keywords_from_excel with first column (index 0)
+        provided_topics = load_rtc_keywords_from_excel(file_path, sheet_name, first_col_index=0)
+        print(f"  Loaded {len(provided_topics)} provided topics from keywords sheet")
+        return provided_topics
+    except Exception as e:
+        print(f"[WARN] Error loading provided topics: {e}")
+        return []
+
+
+def perform_topic_modeling(
+    texts: List[str],
+    num_topics: int = 5,
+    min_topic_size: int = 2,
+    language: str = "english",
+    max_texts: int = None
+) -> Tuple:
+    """
+    Perform topic modeling using TF-IDF (replaces BERTopic for better results on short responses).
+
+    texts: List of text documents (responses)
+    num_topics: Target number of topics to infer (returns num_topics * 3 individual terms)
+    min_topic_size: Unused (kept for backward compatibility)
+    language: Language for stopwords
+    max_texts: Unused (kept for backward compatibility; processes all texts)
+    returns: Tuple of (None, inferred_topics, None) where inferred_topics is a list of individual keywords
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    try:
+        print("[INFO] Using TF-IDF for topic modeling...")
+
+        # Filter out empty texts
+        valid_texts = [t for t in texts if isinstance(t, str) and t.strip()]
+
+        if len(valid_texts) < 2:
+            print(f"[WARN] Not enough text samples ({len(valid_texts)}) for topic modeling. Skipping.")
+            return None, [], None
+
+        print(f"  Fitting TF-IDF on {len(valid_texts):,} texts...")
+
+        # Initialize TF-IDF vectorizer with specified parameters
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=10,
+            max_df=0.85,
+            stop_words='english'
+        )
+
+        # Fit and transform
+        tfidf_matrix = vectorizer.fit_transform(valid_texts)
+
+        # Sum TF-IDF scores across all documents to rank terms by global importance
+        tfidf_scores = tfidf_matrix.sum(axis=0).A1  # Convert to 1D array
+
+        # Get feature names
+        feature_names = vectorizer.get_feature_names_out()
+
+        # Create list of (term, score) tuples and sort by score
+        term_scores = list(zip(feature_names, tfidf_scores))
+        term_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Filter terms: remove <5 chars, stopwords, excluded keywords, numeric-only
+        # Also remove terms appearing in >30% of responses (too common/filler)
+        filtered_terms = []
+        nltk_stopwords = set(stopwords.words("english")) if STOP_WORDS is None else STOP_WORDS
+
+        # Calculate appearance threshold (30% of documents)
+        appearance_threshold = len(valid_texts) * 0.30
+
+        for term, score in term_scores:
+            # Skip if too short (5+ character requirement)
+            if len(term) < 5:
+                continue
+            # Skip if in stopwords or excluded keywords
+            if term.lower() in nltk_stopwords or term.lower() in EXCLUDED_KEYWORDS:
+                continue
+            # Skip if purely numeric
+            if term.replace(' ', '').isdigit():
+                continue
+
+            # Count how many documents contain this term
+            term_appears = sum(1 for text in valid_texts if term.lower() in text.lower())
+            # Skip if too common (appears in >60% of responses)
+            if term_appears > appearance_threshold:
+                continue
+
+            filtered_terms.append(term)
+
+        # Return top num_topics * 3 terms as individual topics
+        target_count = num_topics * 3
+        inferred_topics = filtered_terms[:target_count]
+
+        print(f"  Topic modeling complete. Found {len(inferred_topics)} inferred topics.")
+
+        return None, inferred_topics, None
+
+    except Exception as e:
+        print(f"[ERROR] Topic modeling failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, [], None
+
+
+def extract_inferred_topics(
+    inferred_topics: List[str],
+    num_topics: int = 5
+) -> List[str]:
+    """
+    Extract individual inferred topics (no longer using BERTopic model).
+    Each topic string is returned as-is (no grouping, no prefix).
+
+    inferred_topics: List of inferred topic strings from TF-IDF
+    num_topics: Unused (kept for backward compatibility)
+    returns: List of topic strings (already individual, no prefixes)
+    """
+    if inferred_topics is None or not inferred_topics:
+        return []
+
+    # Topics are already individual strings from perform_topic_modeling
+    # No further processing needed
+    return inferred_topics
+
+
+def match_responses_to_topics(
+    df: pd.DataFrame,
+    provided_topics: List[str],
+    inferred_topics: List[str],
+    model=None,
+    topics_array=None,
+    probabilities=None
+) -> pd.DataFrame:
+    """
+    Match each response to relevant topics using keyword presence (both provided and inferred).
+    Deduplicates topics case-insensitively (provided topics take priority).
+
+    df: DataFrame with responses
+    provided_topics: List of provided topics (individual keywords/phrases)
+    inferred_topics: List of inferred topics (individual keywords/phrases)
+    model: Unused (kept for backward compatibility)
+    topics_array: Unused (kept for backward compatibility)
+    probabilities: Unused (kept for backward compatibility)
+    returns: DataFrame with topic assignments for each response
+    """
+    df_topics = df.copy()
+
+    # Deduplicate topics case-insensitively (provided topics take priority)
+    all_topics = list(provided_topics)
+    seen_lower = {t.lower() for t in provided_topics}
+
+    for topic in inferred_topics:
+        if topic.lower() not in seen_lower:
+            all_topics.append(topic)
+            seen_lower.add(topic.lower())
+
+    # Initialize topic columns
+    for topic in all_topics:
+        df_topics[topic] = ""
+
+    # Process each response
+    for idx, row in df_topics.iterrows():
+        text = str(row['response_text_original']).lower() if pd.notna(row['response_text_original']) else ""
+
+        if not text:
+            continue
+
+        # Match all topics using word boundary regex matching
+        for topic in all_topics:
+            # Use word boundary matching for each topic term
+            pattern = r"\b" + re.escape(topic.lower()) + r"\b"
+            if re.search(pattern, text):
+                df_topics.at[idx, topic] = row['response_id']
+
+    return df_topics
+
+
+# =============================================================================
+# STEP 5.5: EXPORT - Additional topic-based outputs
+# =============================================================================
+
+def generate_topics_csv(
+    df: pd.DataFrame,
+    provided_topics: List[str],
+    inferred_topics: List[str],
+    output_folder: str = "data/final"
+) -> None:
+    """
+    Generate topics.csv where each column is a topic and contains
+    all response_ids that relate to that topic.
+    
+    df: DataFrame with topic assignments (from match_responses_to_topics)
+    provided_topics: List of provided topics
+    inferred_topics: List of inferred topics
+    output_folder: Output directory path
+    """
+    print("\n[STEP 5.5] EXPORT - Generating topics.csv...")
+    
+    all_topics = provided_topics + inferred_topics
+    
+    if not all_topics:
+        print("[WARN] No topics found. Skipping topics.csv generation.")
+        return
+    
+    # Create topics CSV with clean response data
+    topic_data = {}
+
+    for topic in all_topics:
+        if topic in df.columns:
+            # Get all non-empty response IDs for this topic
+            responses = df[topic].dropna()
+            responses = responses[responses != ""]
+            # Filter out topics with zero responses
+            if len(responses) > 0:
+                topic_data[topic] = responses.tolist()
+    
+    # Find max length for consistent row count
+    max_responses = max(len(v) for v in topic_data.values()) if topic_data else 0
+    
+    # Create DataFrame with topics as columns and response IDs as values
+    topics_output = {}
+    for topic, response_ids in topic_data.items():
+        # Pad with empty strings to match max length
+        padded = response_ids + [""] * (max_responses - len(response_ids))
+        topics_output[topic] = padded
+    
+    topics_df = pd.DataFrame(topics_output)
+    
+    # Save to CSV
+    topics_path = os.path.join(output_folder, "topics.csv")
+    try:
+        topics_df.to_csv(topics_path, index=False)
+        print(f"  Saved {len(topics_df.columns)} topics to {topics_path}")
+        print(f"    • Topics: {len(provided_topics)} provided + {len(inferred_topics)} inferred")
+        for topic in all_topics:
+            if topic in topics_df.columns:
+                count = (topics_df[topic] != "").sum()
+                print(f"    • {topic}: {count} responses")
+    except Exception as e:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        topics_path = os.path.join(output_folder, f"topics_{ts}.csv")
+        print(f"[WARN] Error writing topics file. Trying alternative path: {topics_path}")
+        topics_df.to_csv(topics_path, index=False)
+
+
+# =============================================================================
+# STEP 6: EXPORT - Generate summaries and save
 # =============================================================================
 
 def generate_summary_by_question(df: pd.DataFrame) -> pd.DataFrame:
     """
     Generate summary statistics grouped by question with keywords expanded to separate rows.
-    Keywords are already filtered by RTC similarity during extraction.
+
+    To allow Tableau to better aggregate keywords, creates one row per keyword per question.
+
+    Output format:
+    - One row per question-keyword combination
+    - Tableau can easily count, filter, and visualize keywords across questions
     """
     print("\n[STEP 5/5] EXPORT - generating summaries...")
 
@@ -869,7 +1142,9 @@ def run_pipeline(
     data_folder: str = "data",
     output_folder: str = "data/final",
     rtc_keywords_file: Optional[str] = None,
-    similarity_threshold: float = 0.35
+    similarity_threshold: float = 0.35,
+    excel_file: str = "data/UVABAIData.xlsx",
+    num_topics: int = 5
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     data_folder: path to input data folder
@@ -880,6 +1155,8 @@ def run_pipeline(
     similarity_threshold: cosine similarity cutoff for filtering RAKE keywords
                           against RTC keywords. Lower = more permissive.
                           Recommended range: 0.25–0.50. Default 0.35.
+    excel_file: path to Excel file containing keywords/topics sheet
+    num_topics: number of topics to infer with BERTopic
 
     return: tuple of (responses_with_features_df, summary_by_question_df)
     """
@@ -967,6 +1244,42 @@ def run_pipeline(
     generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
     df = df.drop(columns=["keywords"])                # drop after reuse
     
+    df = df.drop(columns=["keywords"])
+    
+    # Task 21: Load provided topics and perform topic modeling
+    print("\n[TASK 21] TOPIC MODELING - Inferring topics from responses...")
+    provided_topics = load_provided_topics(excel_file)
+
+    # Perform TF-IDF topic modeling on response texts
+    model, inferred_topics_raw, probabilities = perform_topic_modeling(
+        texts=df['response_text_original'].fillna("").tolist(),
+        num_topics=num_topics
+    )
+
+    # Extract individual inferred topics
+    inferred_topics = extract_inferred_topics(inferred_topics_raw, num_topics=num_topics)
+    if inferred_topics:
+        print(f"  Inferred {len(inferred_topics)} topics from response texts")
+
+    # Match responses to topics (Task 21 & 22 setup)
+    print("\n[TASK 21/22] TOPIC ASSIGNMENT - Matching responses to topics...")
+    df_with_topics = match_responses_to_topics(
+        df,
+        provided_topics,
+        inferred_topics
+    )
+    
+    summary_df = generate_summary_by_question(df)
+    generate_keywords_csv(df, output_folder)
+    
+    # Task 22: Generate topics.csv
+    print("\n[TASK 22] TOPIC AGGREGATION - Creating topics.csv...")
+    generate_topics_csv(df_with_topics, provided_topics, inferred_topics, output_folder)
+    
+    # create output directory
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # save outputs
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
     
@@ -998,6 +1311,8 @@ def run_pipeline(
     print(f"     → Simple keyword list for word clouds")
     print(f"\nEmbedding method: {EMBEDDING_METHOD or 'none (exact match only)'}")
     print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
+    print(f"  4. {os.path.join(output_folder, 'topics.csv')}")
+    print(f"     → Topic assignments ({len(provided_topics)} provided + {len(inferred_topics)} inferred topics)")
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nReady for Tableau import!")
     print("=" * 80)
