@@ -92,6 +92,7 @@ SEED_KEYWORDS = {
 # =============================================================================
 
 def _ensure_nltk():
+def _ensure_nltk():
     resources = [
         ("corpora/stopwords", "stopwords"),
         ("corpora/wordnet", "wordnet"),
@@ -189,7 +190,6 @@ def _embed_text(text: str) -> Optional[np.ndarray]:
         return avg / (np.linalg.norm(avg) + 1e-10)
 
     return None
-
 
 def _embed_batch(texts: List[str]) -> np.ndarray:
     """
@@ -396,7 +396,6 @@ def load_and_transform_data(folder: str = "data") -> pd.DataFrame:
     print(f"    • unique surveys/sheets: {len(unique_sheets)}")
     
     return long_df
-
 
 def load_rtc_keywords_from_csv(file_path: str) -> Tuple[List[str], Dict[str, str]]:
     """
@@ -623,7 +622,30 @@ def add_sentiment_analysis(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def get_seed_keywords():
-    return SEED_KEYWORDS   
+    return SEED_KEYWORDS  
+
+# using this helped instead of find present rtc kw since it rebuilds a df every time
+def get_rtc_keywords_in_text(text: str, rtc_keywords: List[str]) -> List[str]:
+    """
+    Return RTC keywords that appear in the given text.
+    Uses simple regex word-boundary matching.
+    """
+    if not text or not rtc_keywords:
+        return []
+    
+    text_lower = text.lower()
+    found = []
+
+    for kw in rtc_keywords:
+        kw_norm = kw.strip().lower()
+        if not kw_norm:
+            continue
+
+        pattern = r"\b" + re.escape(kw_norm) + r"\b"
+        if re.search(pattern, text_lower):
+            found.append(kw_norm)
+
+    return found 
 
 def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int]:
     """
@@ -665,6 +687,13 @@ def extract_keywords(text: Optional[str], max_phrases: int = 5) -> Dict[str, int
         keyword_dict = filter_keywords_by_rtc_similarity(keyword_dict)
         
         KEYWORD_CACHE[text] = keyword_dict
+
+        # ── add RTC keywords found directly in text ──
+        rtc_keywords_in_text = get_rtc_keywords_in_text(text, RTC_KEYWORDS_LIST)
+
+        for kw in rtc_keywords_in_text:
+            keyword_dict[kw] = keyword_dict.get(kw, 0) + 1
+
         return keyword_dict
     except Exception as e:
         global KEYWORD_EXTRACTION_ERROR_SHOWN, STOP_WORDS, LEMMATIZER
