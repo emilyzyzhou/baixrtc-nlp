@@ -4,3 +4,5 @@ regex
 nltk
 rake-nltk
 vaderSentiment
+bertopic
+sentence-transformers
