@@ -92,7 +92,6 @@ SEED_KEYWORDS = {
 # =============================================================================
 
 def _ensure_nltk():
-def _ensure_nltk():
     resources = [
         ("corpora/stopwords", "stopwords"),
         ("corpora/wordnet", "wordnet"),
@@ -965,8 +964,30 @@ def run_pipeline(
 
     summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
     generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
-    df = df.drop(columns=["keywords"])                # drop after reuse
-    
+
+    # ── Task 23: Convert keywords JSON → "theme" column, then select final columns ──
+    df["theme"] = df["keywords"].apply(
+        lambda x: ", ".join(json.loads(x).keys()) if x and x != "{}" else ""
+    )
+    df = df.drop(columns=["keywords"])
+
+    df = df.rename(columns={
+        "response_text_original": "response_text",
+        "question_text_original": "question_text",
+    })
+    df = df[[
+        "response_id",
+        "survey_id",
+        "question_id",
+        "response_text",
+        "sentiment_label",
+        "sentiment_score",
+        "theme",
+        "question_text",
+        "sheet_name",
+        "source_file",
+    ]]
+
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
     
