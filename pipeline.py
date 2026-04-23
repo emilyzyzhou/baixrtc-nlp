@@ -96,7 +96,6 @@ SEED_KEYWORDS = {
 # =============================================================================
 
 def _ensure_nltk():
-def _ensure_nltk():
     resources = [
         ("corpora/stopwords", "stopwords"),
         ("corpora/wordnet", "wordnet"),
@@ -1145,10 +1144,14 @@ def run_pipeline(
     similarity_threshold: float = 0.35,
     excel_file: str = "data/UVABAIData.xlsx",
     num_topics: int = 5
+    rtc_keywords_file: Optional[str] = None,
+    similarity_threshold: float = 0.35
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     data_folder: path to input data folder
     output_folder: path to output folder
+    excel_file: path to Excel file containing keywords/topics sheet
+    num_topics: number of topics to infer with BERTopic
     rtc_keywords_file: path to CSV with RTC keywords (left column).
                        If None, looks for 'keywords.csv' in data_folder or
                        tries to load from the first .xlsx 'keywords' sheet.
@@ -1242,6 +1245,41 @@ def run_pipeline(
 
     summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
     generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
+
+    # ── Task 23: Convert keywords JSON → "theme" column, then select final columns ──
+    df["theme"] = df["keywords"].apply(
+        lambda x: ", ".join(json.loads(x).keys()) if x and x != "{}" else ""
+    )
+
+    # ── Task 20: Aggregate filtered RAKE keywords and combine with present RTC keywords 
+    # STUB: filtered_rake_kw aggregated from df["keywords"] below
+    filtered_rake_kw = Counter()
+    for kw_json in df["keywords"].dropna():
+        try:
+            kw_dict = json.loads(kw_json)
+            filtered_rake_kw.update(kw_dict)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Get RTC keywords that are actually present in the data
+    present_rtc_kw = find_present_rtc_keywords(df, rtc_keywords, text_column="response_text_original")
+
+    # Combine both keyword lists
+    combined_keywords = Counter(filtered_rake_kw)  # Start with RAKE keywords
+    seen_lower = {k.lower() for k in filtered_rake_kw.keys()}
+
+    # Add present_rtc_kw that aren't already in RAKE pool
+    for rtc_kw in present_rtc_kw:
+        if rtc_kw.lower() not in seen_lower:
+            # Count actual occurrences in response text
+            pattern = r"\b" + re.escape(rtc_kw.lower()) + r"\b"
+            count = sum(1 for text in df["response_text_original"].dropna().astype(str)
+                       if re.search(pattern, text.lower()))
+            if count > 0:
+                combined_keywords[rtc_kw] = count
+
+    summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
+    generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
     df = df.drop(columns=["keywords"])                # drop after reuse
     
     df = df.drop(columns=["keywords"])
@@ -1280,6 +1318,26 @@ def run_pipeline(
     os.makedirs(output_folder, exist_ok=True)
     
     # save outputs
+
+    df = df.rename(columns={
+        "response_text_original": "response_text",
+        "question_text_original": "question_text",
+    })
+    df = df[[
+        "response_id",
+        "survey_id",
+        "question_id",
+        "response_text",
+        "sentiment_label",
+        "sentiment_score",
+        "theme",
+        "question_text",
+        "sheet_name",
+        "source_file",
+    ]]
+
+    
+    # save outputs
     responses_path = os.path.join(output_folder, "responses_with_features.csv")
     summary_path = os.path.join(output_folder, "summary_by_question.csv")
     
@@ -1309,6 +1367,8 @@ def run_pipeline(
     print(f"     → {len(summary_df)} questions with aggregated statistics")
     print(f"  3. {os.path.join(output_folder, 'keywords.csv')}")
     print(f"     → Simple keyword list for word clouds")
+    print(f"  4. {os.path.join(output_folder, 'topics.csv')}")
+    print(f"     → Topic assignments ({len(provided_topics)} provided + {len(inferred_topics)} inferred topics)")
     print(f"\nEmbedding method: {EMBEDDING_METHOD or 'none (exact match only)'}")
     print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
     print(f"  4. {os.path.join(output_folder, 'topics.csv')}")
