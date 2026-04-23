@@ -1144,8 +1144,6 @@ def run_pipeline(
     similarity_threshold: float = 0.35,
     excel_file: str = "data/UVABAIData.xlsx",
     num_topics: int = 5
-    rtc_keywords_file: Optional[str] = None,
-    similarity_threshold: float = 0.35
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     data_folder: path to input data folder
@@ -1251,39 +1249,6 @@ def run_pipeline(
         lambda x: ", ".join(json.loads(x).keys()) if x and x != "{}" else ""
     )
 
-    # ── Task 20: Aggregate filtered RAKE keywords and combine with present RTC keywords 
-    # STUB: filtered_rake_kw aggregated from df["keywords"] below
-    filtered_rake_kw = Counter()
-    for kw_json in df["keywords"].dropna():
-        try:
-            kw_dict = json.loads(kw_json)
-            filtered_rake_kw.update(kw_dict)
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    # Get RTC keywords that are actually present in the data
-    present_rtc_kw = find_present_rtc_keywords(df, rtc_keywords, text_column="response_text_original")
-
-    # Combine both keyword lists
-    combined_keywords = Counter(filtered_rake_kw)  # Start with RAKE keywords
-    seen_lower = {k.lower() for k in filtered_rake_kw.keys()}
-
-    # Add present_rtc_kw that aren't already in RAKE pool
-    for rtc_kw in present_rtc_kw:
-        if rtc_kw.lower() not in seen_lower:
-            # Count actual occurrences in response text
-            pattern = r"\b" + re.escape(rtc_kw.lower()) + r"\b"
-            count = sum(1 for text in df["response_text_original"].dropna().astype(str)
-                       if re.search(pattern, text.lower()))
-            if count > 0:
-                combined_keywords[rtc_kw] = count
-
-    summary_df = generate_summary_by_question(df)    # reuses df["keywords"]
-    generate_keywords_csv(df, output_folder, keyword_pool=combined_keywords)  # pass combined pool
-    df = df.drop(columns=["keywords"])                # drop after reuse
-    
-    df = df.drop(columns=["keywords"])
-    
     # Task 21: Load provided topics and perform topic modeling
     print("\n[TASK 21] TOPIC MODELING - Inferring topics from responses...")
     provided_topics = load_provided_topics(excel_file)
@@ -1306,9 +1271,6 @@ def run_pipeline(
         provided_topics,
         inferred_topics
     )
-    
-    summary_df = generate_summary_by_question(df)
-    generate_keywords_csv(df, output_folder)
     
     # Task 22: Generate topics.csv
     print("\n[TASK 22] TOPIC AGGREGATION - Creating topics.csv...")
