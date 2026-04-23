@@ -6,33 +6,26 @@ PROCESSING FLOW:
 2. PREPROCESS  → Clean and normalize text (lowercase, remove stopwords, lemmatize)
 3. SENTIMENT   → Analyze sentiment using VADER (positive/negative/neutral)
 4. KEYWORDS    → Extract key phrases using RAKE algorithm
-5. EXPORT      → Generate two CSV files ready for Tableau
+5. TOPICS      → Infer topics using TF-IDF and match against provided/inferred topics
+6. FEATURES    → Add keywords, topics, and theme to each response (Tasks 24-25)
+7. EXPORT      → Generate four CSV files ready for Tableau
 
 **OUTPUT FILES & FIELD DEFINITIONS
 **
 FILE 1: responses_with_features.csv
 ------------------------------------
 Row-level data - each row represents one response to one question
-Total columns: 14
+Total columns: 16
 
 IDENTIFIERS:
   response_id          Unique ID for each response (1, 2, 3...)
   survey_id            ID of the survey/sheet (1-6 for your data)
   question_id          ID of the question (1-40 for your data)
 
-RAW TEXT (ORIGINAL):
-  question_text_original    Original question text before cleaning
-  response_text_original    Original response text before cleaning
-                           (Used for sentiment & keywords - preserves nuance)
-
-PROCESSED TEXT (CLEANED):
-  question_text        Preprocessed question (lowercase, no stopwords/punct)
-  response_text        Preprocessed response (lowercase, no stopwords/punct)
-                      (Available for advanced text analysis if needed)
-
-METRICS:
-  response_length      Character count of original response
-  word_count          Word count after preprocessing
+RAW TEXT:
+  response_text        Original response text before cleaning
+                       (Used for sentiment, keywords, and topics)
+  question_text        Original question text
 
 SENTIMENT ANALYSIS:
   sentiment_score      Continuous score from -1.0 (negative) to +1.0 (positive)
@@ -40,10 +33,17 @@ SENTIMENT ANALYSIS:
   sentiment_label      Categorical: "positive" | "negative" | "neutral"
                       Based on sentiment_score thresholds (±0.05)
 
+KEYWORDS & TOPICS (Task 24-25):
+  keywords             Comma-separated list of key phrases extracted from this response
+                      Extracted using RAKE algorithm and filtered against RTC keywords
+  topics               Comma-separated list of topics relevant to this response
+                      Topics matched using provided list + inferred topics from TF-IDF/BERTopic
+  theme                Short summary derived from top keywords in response
+                      (Kept for backward compatibility)
+
 METADATA:
   sheet_name          Original Excel sheet name (survey source)
   source_file         Original Excel/CSV filename
-  timestamp           When the pipeline processed this data
 
 
 FILE 2: summary_by_question.csv
@@ -114,8 +114,24 @@ keywords.csv:
   • Basic keyword frequency visualization
   • Import into simple word cloud tools
 
+FILE 4: topics.csv (Task 22)
+----------------------------
+Topic assignment matrix - each column is a topic, each cell contains matching response_id (or empty)
+Total columns: number of unique topics
+
+STRUCTURE:
+  Each column header is a topic (provided or inferred)
+  Cell values are response_id (e.g., 1, 42, 156) if that response matches the topic
+  Empty cells indicate no match
+
+USAGE:
+  • Identify which responses belong to each topic
+  • Count responses per topic
+  • Cross-reference topics with responses_with_features.csv
+
 FILTERING:
 - Filter by survey_sources to compare surveys
 - Filter by sentiment_label for positive-only or negative-only analysis
+- Filter by keywords or topics columns for detailed analysis
 - Use question_text contains "keyword" for topic-specific analysis
 

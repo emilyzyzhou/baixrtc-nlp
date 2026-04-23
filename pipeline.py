@@ -1276,6 +1276,35 @@ def run_pipeline(
     print("\n[TASK 22] TOPIC AGGREGATION - Creating topics.csv...")
     generate_topics_csv(df_with_topics, provided_topics, inferred_topics, output_folder)
     
+    # Task 24: Add keywords column to responses
+    print("\n[TASK 24] FEATURE ENGINEERING - Adding keywords to responses...")
+    df["keywords"] = df["keywords"].apply(
+        lambda x: ", ".join(json.loads(x).keys()) if x and x != "{}" else "" 
+    )
+    print(f"  Added keywords column with {(df['keywords'] != '').sum()} responses containing keywords")
+    
+    # Task 25: Add topics column to responses
+    print("\n[TASK 25] FEATURE ENGINEERING - Adding topics to responses...")
+    all_topics = provided_topics + inferred_topics
+    
+    # Create a single "topics" column that lists all matching topics for each response
+    topics_list = []
+    for idx, row in df.iterrows():
+        text = str(row['response_text_original']).lower() if pd.notna(row['response_text_original']) else ""
+        matching_topics = []
+        
+        if text:
+            for topic in all_topics:
+                pattern = r"\b" + re.escape(topic.lower()) + r"\b"
+                if re.search(pattern, text):
+                    matching_topics.append(topic)
+        
+        topics_list.append(", ".join(matching_topics) if matching_topics else "")
+    
+    df["topics"] = topics_list
+    print(f"  Added topics column with {(df['topics'] != '').sum()} responses containing topics")
+    print(f"  Topics checked: {len(all_topics)} ({len(provided_topics)} provided + {len(inferred_topics)} inferred)")
+    
     # create output directory
     os.makedirs(output_folder, exist_ok=True)
     
@@ -1292,6 +1321,8 @@ def run_pipeline(
         "response_text",
         "sentiment_label",
         "sentiment_score",
+        "keywords",
+        "topics",
         "theme",
         "question_text",
         "sheet_name",
@@ -1324,7 +1355,7 @@ def run_pipeline(
     print("=" * 80)
     print(f"\nOutputs saved:")
     print(f"  1. {responses_path}")
-    print(f"     → {len(df):,} responses with {len(df.columns)} features")
+    print(f"     → {len(df):,} responses with {len(df.columns)} features (including Task 24 keywords + Task 25 topics)")
     print(f"  2. {summary_path}")
     print(f"     → {len(summary_df)} questions with aggregated statistics")
     print(f"  3. {os.path.join(output_folder, 'keywords.csv')}")
@@ -1333,8 +1364,6 @@ def run_pipeline(
     print(f"     → Topic assignments ({len(provided_topics)} provided + {len(inferred_topics)} inferred topics)")
     print(f"\nEmbedding method: {EMBEDDING_METHOD or 'none (exact match only)'}")
     print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
-    print(f"  4. {os.path.join(output_folder, 'topics.csv')}")
-    print(f"     → Topic assignments ({len(provided_topics)} provided + {len(inferred_topics)} inferred topics)")
     print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\nReady for Tableau import!")
     print("=" * 80)
